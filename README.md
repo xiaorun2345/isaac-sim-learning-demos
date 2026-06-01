@@ -1,0 +1,67 @@
+# Isaac Sim Learning Demos
+
+This repository contains 15 progressive Python demos for learning:
+
+- Isaac Sim standalone Python scripting
+- Scene building and sensors
+- Franka articulation control and grasping
+- ROS 2 integration concepts
+- Isaac Lab structure
+- GR00T-style VLA inference workflows
+
+## Learning Path
+
+### Core Isaac Sim
+
+1. `01_minimal_scene`
+2. `02_lights_and_prims`
+3. `03_multi_object_physics`
+4. `04_camera_capture`
+5. `05_franka_joint_control`
+6. `06_franka_gripper_sequence`
+7. `07_franka_pick_cube`
+8. `08_pick_place_state_machine`
+9. `09_ros2_basics`
+10. `10_ros2_franka_control`
+
+### Isaac Lab + VLA
+
+11. `11_isaac_lab_minimal`
+12. `12_vla_observation_pipeline`
+13. `13_groot_inference`
+14. `14_groot_pick_place`
+15. `15_multi_instruction_vla`
+
+## Repository Layout
+
+- `common/`: shared helpers
+- `01_*` to `15_*`: one demo folder per lesson
+- `docs/superpowers/`: design and plan documents
+
+Each demo folder contains:
+
+- `demo.py`
+- `README.md`
+
+## How To Run
+
+### Isaac Sim demos
+
+Run `01-10` from an Isaac Sim Python environment. A typical Windows pattern is:
+
+```powershell
+python.bat .\01_minimal_scene\demo.py
+```
+
+### Isaac Lab demos
+
+Run `11-15` from an Isaac Lab environment that can import both Isaac Lab and the required NVIDIA robotics stack.
+
+## Notes
+
+- Some imports and asset paths can vary slightly between Isaac Sim versions.
+- The ROS 2 demos are intentionally teaching-oriented and may need local bridge setup.
+- Demo `09` includes both the Isaac Sim camera publisher and the external ROS 2 image subscriber.
+- Demo `10` includes both the Isaac Sim Franka bridge and an external ROS 2 command publisher.
+- Demos `13-15` include offline walkthroughs plus real GR00T N1.7 `PolicyClient` examples.
+- Real GR00T observation and action keys must match the embodiment configuration selected on the policy server.
