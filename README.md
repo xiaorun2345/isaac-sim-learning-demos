@@ -37,6 +37,7 @@ This repository contains 15 progressive Python demos for learning:
 - `common/`: shared helpers
 - `01_*` to `15_*`: one demo folder per lesson
 - `docs/superpowers/`: design and plan documents
+- [`docs/franka-panda-introduction.md`](docs/franka-panda-introduction.md): illustrated Franka Panda beginner guide
 
 Each demo folder contains:
 
