@@ -20,24 +20,29 @@ Files:
 
 Suggested workflow:
 
-1. Source ROS 2 in the terminal that launches Isaac Sim.
+1. Start Isaac Sim side from a clean environment:
+
+```bash
+bash run_demo.sh
+```
+
 2. Start the Isaac Sim scene publisher:
 
 ```bash
-python demo.py
+bash run_demo.sh
 ```
 
-3. In another ROS 2 sourced terminal, check the topic:
+3. In another terminal, use the ROS 2 subscriber environment:
+
+```bash
+bash run_subscriber.sh
+```
+
+4. Check the topic:
 
 ```bash
 ros2 topic list
 ros2 topic info /front_camera/rgb
-```
-
-4. Start the subscriber:
-
-```bash
-python subscriber.py
 ```
 
 5. Optionally inspect the image visually:
@@ -52,9 +57,8 @@ Expected communication chain:
 
 Notes:
 
-- Run `demo.py` from an Isaac Sim Python environment.
-- Run `subscriber.py` from a ROS 2 Python environment with `rclpy` and `sensor_msgs`.
-- If your ROS 2 domain is customized, keep the Isaac Sim terminal and subscriber terminal on the same `ROS_DOMAIN_ID`.
+- `run_demo.sh` clears external ROS 2 Python variables and launches `demo.py` with `/home/mkls/xiao_run/.conda-isaac-openvla`.
+- `run_subscriber.sh` sources `/opt/ros/humble/setup.bash` and runs `subscriber.py` with the system ROS 2 environment.
 
 Official references:
 

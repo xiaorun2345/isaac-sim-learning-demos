@@ -1,10 +1,11 @@
-"""Franka scene demo that publishes a front camera RGB image over ROS 2.
+"""Franka ROS 2 camera demo.
 
-Run this file from an Isaac Sim Python environment after sourcing ROS 2:
+这个文件以 `build_franka_scene_only.py` 的场景代码为基准，只额外增加一件事：
+把前视相机图像通过 ROS 2 发布到 `/front_camera/rgb`。
+
+运行方式：
 
     python demo.py
-
-Then run `subscriber.py` from a ROS 2 terminal to verify the image stream.
 """
 
 from __future__ import annotations
@@ -17,12 +18,15 @@ from isaacsim import SimulationApp
 
 
 def parse_args() -> argparse.Namespace:
+    """解析启动参数。"""
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--headless", action="store_true", help="Build the scene without opening the UI.")
     return parser.parse_args()
 
 
 ARGS = parse_args()
+
 simulation_app = SimulationApp(
     {
         "headless": ARGS.headless,
@@ -81,6 +85,8 @@ def create_camera(
     rotation_xyz_deg: tuple[float, float, float],
     focal_length: float,
 ) -> None:
+    """在当前 USD stage 中创建一个相机 prim。"""
+
     if path == WRIST_CAMERA_PATH:
         position = (0.06, 0.0, 0.03)
         rotation_xyz_deg = (-95.0, 0.0, -90.0)
@@ -96,14 +102,16 @@ def create_camera(
 
 
 def create_ros2_camera_graph(width: int = 1280, height: int = 720) -> str:
+    """创建 ROS 2 图像发布 OmniGraph。"""
+
     import omni.graph.core as og
     import omni.kit.app
 
     manager = omni.kit.app.get_app().get_extension_manager()
-    manager.set_extension_enabled_immediate("omni.graph.action_nodes_core", True)
-    manager.set_extension_enabled_immediate("omni.graph.bundle.action", True)
-    manager.set_extension_enabled_immediate("isaacsim.core.nodes", True)
-    manager.set_extension_enabled_immediate("isaacsim.ros2.bridge", True)
+    enabled_names = {ext["name"] for ext in manager.get_extensions() if ext.get("enabled")}
+    if "isaacsim.ros2.bridge" not in enabled_names:
+        manager.set_extension_enabled_immediate("isaacsim.ros2.bridge", True)
+        omni.kit.app.get_app().update()
 
     stage = get_current_stage()
     if stage.GetPrimAtPath(ROS2_CAMERA_GRAPH_PATH).IsValid():
@@ -129,7 +137,7 @@ def create_ros2_camera_graph(width: int = 1280, height: int = 720) -> str:
                 ("CreateRenderProduct.inputs:cameraPrim", [Sdf.Path(FRONT_CAMERA_PATH)]),
                 ("CreateRenderProduct.inputs:width", max(1, width)),
                 ("CreateRenderProduct.inputs:height", max(1, height)),
-                ("ROS2Context.inputs:useDomainIDEnvVar", True),
+                ("ROS2Context.inputs:useDomainIDEnvVar", False),
                 ("PublishRgb.inputs:frameId", "front_camera"),
                 ("PublishRgb.inputs:nodeNamespace", "front_camera"),
                 ("PublishRgb.inputs:queueSize", 1),
@@ -142,6 +150,8 @@ def create_ros2_camera_graph(width: int = 1280, height: int = 720) -> str:
 
 
 def create_lights() -> None:
+    """创建场景灯光。"""
+
     stage = get_current_stage()
 
     dome = UsdLux.DomeLight.Define(stage, "/World/Lights/Dome")
@@ -158,6 +168,8 @@ def create_lights() -> None:
 
 
 def add_room(world: World) -> None:
+    """向世界中添加一个简化的房间外壳。"""
+
     world.scene.add(
         FixedCuboid(
             name="room_floor",
@@ -201,6 +213,8 @@ def add_room(world: World) -> None:
 
 
 def add_table(world: World) -> None:
+    """添加工作台。"""
+
     world.scene.add(
         FixedCuboid(
             name="table",
@@ -214,6 +228,8 @@ def add_table(world: World) -> None:
 
 
 def add_place_box(world: World) -> None:
+    """创建一个开口盒子，作为放置目标区域。"""
+
     bottom_z = TABLE_SURFACE_Z + PLACE_BOX_BOTTOM_H / 2.0
     wall_z = TABLE_SURFACE_Z + PLACE_BOX_BOTTOM_H + PLACE_BOX_WALL_H / 2.0
 
@@ -270,6 +286,8 @@ def add_place_box(world: World) -> None:
 
 
 def add_franka(world: World) -> SingleManipulator:
+    """把 Franka 机器人加入到场景并返回控制对象。"""
+
     assets_root = get_assets_root_path()
     if assets_root is None:
         raise RuntimeError("Isaac Sim assets root is unavailable.")
@@ -284,6 +302,7 @@ def add_franka(world: World) -> SingleManipulator:
         joint_closed_positions=np.array([0.01, 0.01]),
         action_deltas=np.array([0.01, 0.01]),
     )
+
     franka = world.scene.add(
         SingleManipulator(
             prim_path=FRANKA_PRIM_PATH,
@@ -298,6 +317,8 @@ def add_franka(world: World) -> SingleManipulator:
 
 
 def add_cubes(world: World) -> list[DynamicCuboid]:
+    """添加动态方块。"""
+
     cubes: list[DynamicCuboid] = []
     for name, position, scale, color in CUBES:
         cubes.append(
@@ -316,6 +337,8 @@ def add_cubes(world: World) -> list[DynamicCuboid]:
 
 
 def build_scene() -> tuple[World, SingleManipulator, list[DynamicCuboid]]:
+    """构建完整场景。"""
+
     world = World(stage_units_in_meters=1.0)
     create_lights()
     add_room(world)
@@ -362,6 +385,8 @@ def build_scene() -> tuple[World, SingleManipulator, list[DynamicCuboid]]:
 
 
 def main() -> None:
+    """脚本主入口。"""
+
     try:
         world, _, _ = build_scene()
         if ARGS.headless:
