@@ -4,3 +4,4 @@ __pycache__/
 .venv/
 .idea/
 .vscode/
+17_franka_smolvla_data_collection/outputs/
