@@ -32,6 +32,33 @@ python isaac-sim-learning-demos/17_franka_smolvla_data_collection/demo.py --head
 python isaac-sim-learning-demos/17_franka_smolvla_data_collection/demo.py --episodes 50
 ```
 
+## 动作回放
+
+如果你想在 Isaac Sim 里重新执行某条已采集的轨迹，可以运行：
+
+```bash
+python isaac-sim-learning-demos/17_franka_smolvla_data_collection/replay_episode.py
+```
+
+回放指定 episode：
+
+```bash
+python isaac-sim-learning-demos/17_franka_smolvla_data_collection/replay_episode.py --episode 1
+```
+
+循环回放：
+
+```bash
+python isaac-sim-learning-demos/17_franka_smolvla_data_collection/replay_episode.py --episode 1 --loop
+```
+
+说明：
+
+1. 当前回放的是 `npz` 里的动作序列，不是直接播放图像
+2. 也就是说，Isaac 会重新搭场景，并按保存下来的 `action` 逐帧驱动 Franka
+3. 当前 `action` 语义是：`target_ee_xyz + target_gripper_closed`
+4. 因为 raw 数据里没有保存每一帧完整物理真值，所以它是“动作重放”，不是严格视频级状态复刻
+
 ## 当前采集内容
 
 每个 episode 会保存以下核心字段：

@@ -1,27 +1,31 @@
-"""Franka SmolVLA 数据采集示例。
+"""在 Isaac Sim 中回放 17_demo 采集得到的原始 NPZ 轨迹。
 
-这个脚本会在 Isaac Sim 中创建一个 Franka 桌面抓取场景，并用内置的
-PickPlaceController 作为“专家策略”自动采集示教数据。
+这个脚本不是播放保存下来的图像，而是：
 
-采集内容包括：
-1. 前视相机图像
-2. 手腕相机图像
-3. 机器人状态（7 关节、末端位置、末端姿态、夹爪开合宽度）
-4. 专家动作（末端目标位置、夹爪开合真值）
+1. 重新搭建与采集时一致的 Franka 场景
+2. 按 episode 里的动作序列逐帧驱动 Franka
+3. 在 Isaac Sim 中重新执行整条轨迹
 
-数据会按 episode 保存为压缩 `.npz` 文件，字段命名尽量贴近后续
-SmolVLA / LeRobot 常用格式，便于后续转换。
+当前支持回放的动作语义是：
+
+    [target_ee_pos_x, target_ee_pos_y, target_ee_pos_z, target_gripper_closed]
+
+也就是：
+1. 末端目标位置
+2. 夹爪闭合标记
 
 运行示例：
 
-    python isaac-sim-learning-demos/17_franka_smolvla_data_collection/demo.py
-    python isaac-sim-learning-demos/17_franka_smolvla_data_collection/demo.py --episodes 50 --headless
+    python isaac-sim-learning-demos/17_franka_smolvla_data_collection/replay_episode.py
+    python isaac-sim-learning-demos/17_franka_smolvla_data_collection/replay_episode.py --episode 1
+    python isaac-sim-learning-demos/17_franka_smolvla_data_collection/replay_episode.py --headless
 """
 
 from __future__ import annotations
 
 import argparse
-import json
+import re
+import time
 import traceback
 from pathlib import Path
 
@@ -30,17 +34,19 @@ from isaacsim import SimulationApp
 
 
 def parse_args() -> argparse.Namespace:
-    """解析少量必要参数，避免把脚本做成参数堆。"""
+    """解析回放参数。"""
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--episodes", type=int, default=20, help="采集多少个 episode。")
-    parser.add_argument("--headless", action="store_true", help="无界面运行。")
     parser.add_argument(
-        "--output-dir",
+        "--raw-dir",
         type=Path,
         default=Path(__file__).resolve().parent / "outputs" / "raw",
-        help="数据输出目录。",
+        help="原始 npz episode 所在目录。",
     )
+    parser.add_argument("--episode", type=int, default=0, help="回放哪一个 episode。默认回放 episode_00000.npz")
+    parser.add_argument("--fps", type=float, default=20.0, help="回放节奏。")
+    parser.add_argument("--headless", action="store_true", help="无界面运行。")
+    parser.add_argument("--loop", action="store_true", help="循环回放。")
     return parser.parse_args()
 
 
@@ -71,6 +77,7 @@ from isaacsim.storage.native import get_assets_root_path
 from pxr import Gf, UsdGeom, UsdLux
 
 
+# 这部分场景配置与 demo.py 保持一致，保证“采集时”和“回放时”环境尽量一致。
 TABLE_H = 0.40
 TABLE_CENTER = np.array([0.45, 0.0, TABLE_H / 2.0], dtype=np.float32)
 TABLE_SIZE = np.array([1.0, 0.8, TABLE_H], dtype=np.float32)
@@ -85,7 +92,6 @@ FRONT_CAMERA_TARGET = np.array([0.46, 0.00, 0.55], dtype=np.float32)
 
 FRONT_CAMERA_RESOLUTION = (640, 480)
 WRIST_CAMERA_RESOLUTION = (640, 480)
-CAMERA_FREQUENCY = 20
 
 CUBE_SIZE = np.array([0.045, 0.045, 0.045], dtype=np.float32)
 CUBE_HALF_Z = float(CUBE_SIZE[2] / 2.0)
@@ -97,17 +103,13 @@ DISTRACTOR_CUBE_SPECS = [
     ("cube_blue", np.array([0.12, 0.36, 0.86], dtype=np.float32)),
 ]
 
-# 红色目标方块压在最稳的抓取区，优先保证成功率。
 TARGET_CUBE_X_RANGE = (0.42, 0.44)
 TARGET_CUBE_Y_RANGE = (-0.02, 0.02)
 
-# 两个干扰方块固定在左右两侧，仅做视觉干扰，不进入主要抓取路径。
 DISTRACTOR_CUBE_LAYOUT = {
     "cube_green": np.array([0.34, 0.18, TABLE_SURFACE_Z + CUBE_HALF_Z], dtype=np.float32),
     "cube_blue": np.array([0.34, -0.18, TABLE_SURFACE_Z + CUBE_HALF_Z], dtype=np.float32),
 }
-DISTRACTOR_CUBE_JITTER_X = 0.015
-DISTRACTOR_CUBE_JITTER_Y = 0.020
 
 PLACE_BOX_CENTER = np.array([0.64, 0.18], dtype=np.float32)
 PLACE_BOX_OUTER_X = 0.18
@@ -120,56 +122,15 @@ PLACE_GOAL_POSITION = np.array(
     dtype=np.float32,
 )
 
-# 这个 home 姿态用来确保每个 episode 开始时机器人状态一致。
 HOME_JOINT_POSITIONS = np.array(
     [0.0, -0.82, 0.0, -2.10, 0.0, 1.82, 0.78, 0.05, 0.05],
     dtype=np.float32,
 )
+
 EE_TARGET_ORIENTATION = euler_angles_to_quat(np.array([0.0, np.pi, 0.0], dtype=np.float32))
-
 EE_PICK_Z_OFFSET = 0.092
-EE_PLACE_Z_OFFSET = 0.110
-EE_HOVER_MARGIN = 0.140
-
-APPROACH_PICK_STEPS = 40
-DESCEND_PICK_STEPS = 35
-GRASP_HOLD_STEPS = 26
-LIFT_STEPS = 35
-TRANSFER_STEPS = 55
-DESCEND_PLACE_STEPS = 35
-RELEASE_HOLD_STEPS = 26
-RETREAT_STEPS = 30
-
-EPISODE_MAX_STEPS = 360
-EPISODE_SETTLE_STEPS = 20
-EPISODE_POST_SUCCESS_STEPS = 20
-
-STATE_NAMES = [
-    "panda_joint1",
-    "panda_joint2",
-    "panda_joint3",
-    "panda_joint4",
-    "panda_joint5",
-    "panda_joint6",
-    "panda_joint7",
-    "ee_pos_x",
-    "ee_pos_y",
-    "ee_pos_z",
-    "ee_quat_w",
-    "ee_quat_x",
-    "ee_quat_y",
-    "ee_quat_z",
-    "gripper_width",
-]
-
-ACTION_NAMES = [
-    "target_ee_pos_x",
-    "target_ee_pos_y",
-    "target_ee_pos_z",
-    "target_gripper_closed",
-]
-
-TASK_DESCRIPTION = "Pick up the red cube with Franka and place it into the wooden tray."
+ATTACH_POSITION_BLEND = 0.22
+PLACE_SETTLE_STEPS = 12
 
 
 def create_camera_prim(
@@ -178,7 +139,7 @@ def create_camera_prim(
     rotation_xyz_deg: tuple[float, float, float],
     focal_length: float,
 ) -> None:
-    """在 USD 场景里创建相机 prim。"""
+    """在 stage 中创建相机 prim。"""
 
     stage = get_current_stage()
     camera = UsdGeom.Camera.Define(stage, path)
@@ -191,7 +152,7 @@ def create_camera_prim(
 
 
 def create_lights() -> None:
-    """创建基础光照，让两路图像的视觉质量更稳定。"""
+    """创建光照。"""
 
     stage = get_current_stage()
 
@@ -209,7 +170,7 @@ def create_lights() -> None:
 
 
 def add_room(world: World) -> None:
-    """添加简单房间，避免采图背景过空。"""
+    """添加房间包围物。"""
 
     world.scene.add(
         FixedCuboid(
@@ -269,7 +230,7 @@ def add_table(world: World) -> None:
 
 
 def add_place_box(world: World) -> None:
-    """创建放置托盘。"""
+    """添加托盘。"""
 
     bottom_z = TABLE_SURFACE_Z + PLACE_BOX_BOTTOM_H / 2.0
     wall_z = TABLE_SURFACE_Z + PLACE_BOX_BOTTOM_H + PLACE_BOX_WALL_H / 2.0
@@ -328,7 +289,7 @@ def add_place_box(world: World) -> None:
 
 
 def add_franka(world: World) -> SingleManipulator:
-    """把 Franka 以可控制机械臂的形式加入场景。"""
+    """把 Franka 加入场景。"""
 
     assets_root = get_assets_root_path()
     if assets_root is None:
@@ -359,7 +320,7 @@ def add_franka(world: World) -> SingleManipulator:
 
 
 def add_training_cubes(world: World) -> dict[str, DynamicCuboid]:
-    """添加一个可抓取的红色目标方块和两个固定干扰方块。"""
+    """添加与录制端一致的目标方块和干扰方块。"""
 
     target_cube = world.scene.add(
         DynamicCuboid(
@@ -388,7 +349,7 @@ def add_training_cubes(world: World) -> dict[str, DynamicCuboid]:
 
 
 def build_scene() -> tuple[World, SingleManipulator, dict[str, DynamicCuboid]]:
-    """构建完整场景。"""
+    """构建与录制端一致的回放场景。"""
 
     world = World(stage_units_in_meters=1.0)
     create_lights()
@@ -431,31 +392,21 @@ def build_scene() -> tuple[World, SingleManipulator, dict[str, DynamicCuboid]]:
 
 
 def create_cameras() -> tuple[Camera, Camera]:
-    """用传感器接口包装前视相机与手腕相机。"""
+    """初始化相机。
 
-    front_camera = Camera(
-        prim_path=FRONT_CAMERA_PATH,
-        name="front_camera",
-        frequency=CAMERA_FREQUENCY,
-        resolution=FRONT_CAMERA_RESOLUTION,
-    )
-    wrist_camera = Camera(
-        prim_path=WRIST_CAMERA_PATH,
-        name="wrist_camera",
-        frequency=CAMERA_FREQUENCY,
-        resolution=WRIST_CAMERA_RESOLUTION,
-    )
+    这里保留相机初始化，主要是为了让场景结构与采集时一致。
+    回放本身不依赖读取图像，但初始化相机后更利于从界面观察。
+    """
+
+    front_camera = Camera(prim_path=FRONT_CAMERA_PATH, name="front_camera", resolution=FRONT_CAMERA_RESOLUTION)
+    wrist_camera = Camera(prim_path=WRIST_CAMERA_PATH, name="wrist_camera", resolution=WRIST_CAMERA_RESOLUTION)
     front_camera.initialize()
     wrist_camera.initialize()
     return front_camera, wrist_camera
 
 
 def sample_cube_positions(rng: np.random.Generator) -> dict[str, np.ndarray]:
-    """采样三色方块的位置。
-
-    红色方块是唯一抓取目标，因此放在最稳的抓取区。
-    绿色和蓝色方块是固定干扰物，不参与采样。
-    """
+    """按与录制时相同的规则重建红色目标方块初始位置。"""
 
     return {
         TARGET_CUBE_NAME: np.array(
@@ -470,14 +421,14 @@ def sample_cube_positions(rng: np.random.Generator) -> dict[str, np.ndarray]:
 
 
 def reset_robot(franka: SingleManipulator) -> None:
-    """把机器人直接复位到一个统一 home 姿态。"""
+    """把机器人恢复到采集起点姿态。"""
 
     franka.set_joint_positions(HOME_JOINT_POSITIONS)
     franka.set_joint_velocities(np.zeros_like(HOME_JOINT_POSITIONS))
 
 
 def reset_cubes(cubes: dict[str, DynamicCuboid], cube_positions: dict[str, np.ndarray]) -> None:
-    """把三色方块统一复位到新位置。"""
+    """把需要回放的动态方块放回 episode 起始位置。"""
 
     for cube_name, cube in cubes.items():
         cube_position = cube_positions[cube_name]
@@ -489,15 +440,21 @@ def reset_cubes(cubes: dict[str, DynamicCuboid], cube_positions: dict[str, np.nd
         cube.set_angular_velocity(np.zeros(3, dtype=np.float32))
 
 
-def settle_scene(world: World, steps: int) -> None:
-    """给物理系统一点稳定时间。"""
+def settle_scene(world: World, steps: int = 20) -> None:
+    """给物理系统少量稳定时间。"""
 
     for _ in range(steps):
         world.step(render=True)
 
 
 def merge_joint_actions(num_dof: int, *actions: ArticulationAction) -> ArticulationAction:
-    """把机械臂动作和夹爪动作合并成一条控制指令。"""
+    """把多个关节动作合并成一个动作。
+
+    这样做的目的是：
+    1. RMPFlow 输出的是机械臂动作
+    2. gripper.forward 输出的是夹爪动作
+    3. 回放时我们希望同一帧里同时施加这两部分控制
+    """
 
     merged_positions: list[float | None] = [None] * num_dof
     merged_velocities: list[float | None] = [None] * num_dof
@@ -522,7 +479,7 @@ def _merge_single_field(
     values: list[float] | np.ndarray | None,
     indices: list[int] | np.ndarray | None,
 ) -> None:
-    """把一个动作字段写入合并缓冲区。"""
+    """把一个动作字段填入合并缓冲区。"""
 
     if values is None:
         return
@@ -538,217 +495,87 @@ def _merge_single_field(
             target[int(index)] = float(value)
 
 
-def interpolate_positions(
-    start_position: np.ndarray,
-    end_position: np.ndarray,
-    steps: int,
-) -> list[np.ndarray]:
-    """把一段末端轨迹离散成若干步。"""
+def episode_index_from_path(path: Path) -> int:
+    """从 episode 文件名里解析数字编号。"""
 
-    if steps <= 0:
-        return []
-
-    start = np.asarray(start_position, dtype=np.float32)
-    end = np.asarray(end_position, dtype=np.float32)
-    if steps == 1:
-        return [end.copy()]
-
-    positions: list[np.ndarray] = []
-    for alpha in np.linspace(0.0, 1.0, steps, endpoint=True):
-        positions.append(((1.0 - alpha) * start + alpha * end).astype(np.float32))
-    return positions
+    match = re.search(r"episode_(\d+)\.npz$", path.name)
+    if not match:
+        return 0
+    return int(match.group(1))
 
 
-def build_scripted_actions(
-    start_ee_position: np.ndarray,
-    target_cube_position: np.ndarray,
-) -> list[np.ndarray]:
-    """生成一条显式的抓取放置任务空间专家轨迹。"""
+def resolve_episode_path(raw_dir: Path, episode: int) -> Path:
+    """解析要回放的 episode 文件路径。"""
 
-    pick_position = np.array(
-        [
-            float(target_cube_position[0]),
-            float(target_cube_position[1]),
-            float(target_cube_position[2] + EE_PICK_Z_OFFSET),
-        ],
-        dtype=np.float32,
-    )
-    pick_hover_position = pick_position + np.array([0.0, 0.0, EE_HOVER_MARGIN], dtype=np.float32)
-
-    place_position = np.array(
-        [
-            float(PLACE_GOAL_POSITION[0]),
-            float(PLACE_GOAL_POSITION[1]),
-            float(PLACE_GOAL_POSITION[2] + EE_PLACE_Z_OFFSET),
-        ],
-        dtype=np.float32,
-    )
-    place_hover_position = place_position + np.array([0.0, 0.0, EE_HOVER_MARGIN], dtype=np.float32)
-
-    actions: list[np.ndarray] = []
-
-    def append_segment(start: np.ndarray, end: np.ndarray, closed: float, steps: int) -> np.ndarray:
-        last_position = np.asarray(start, dtype=np.float32)
-        for position in interpolate_positions(start, end, steps):
-            actions.append(
-                np.concatenate(
-                    [position, np.array([closed], dtype=np.float32)],
-                ).astype(np.float32)
-            )
-            last_position = position
-        return last_position
-
-    current_position = np.asarray(start_ee_position, dtype=np.float32)
-    current_position = append_segment(current_position, pick_hover_position, 0.0, APPROACH_PICK_STEPS)
-    current_position = append_segment(current_position, pick_position, 0.0, DESCEND_PICK_STEPS)
-    current_position = append_segment(current_position, pick_position, 1.0, GRASP_HOLD_STEPS)
-    current_position = append_segment(current_position, pick_hover_position, 1.0, LIFT_STEPS)
-    current_position = append_segment(current_position, place_hover_position, 1.0, TRANSFER_STEPS)
-    current_position = append_segment(current_position, place_position, 1.0, DESCEND_PLACE_STEPS)
-    current_position = append_segment(current_position, place_position, 0.0, RELEASE_HOLD_STEPS)
-    append_segment(current_position, place_hover_position, 0.0, RETREAT_STEPS)
-    return actions
+    path = raw_dir / f"episode_{episode:05d}.npz"
+    if not path.exists():
+        raise FileNotFoundError(f"Episode file not found: {path}")
+    return path
 
 
-def capture_rgb(camera: Camera) -> np.ndarray:
-    """读取一帧 RGB 图像，并统一成 uint8。"""
-
-    rgb = camera.get_rgb()
-    if rgb is None:
-        raise RuntimeError(f"Camera {camera.prim_path} did not return RGB data.")
-    return np.asarray(rgb, dtype=np.uint8)
-
-
-def get_robot_state(franka: SingleManipulator) -> np.ndarray:
-    """读取训练时常用的状态向量。"""
-
-    joint_positions = np.asarray(franka.get_joint_positions(), dtype=np.float32)
-    ee_position, ee_orientation = franka.end_effector.get_world_pose()
-    ee_position = np.asarray(ee_position, dtype=np.float32)
-    ee_orientation = np.asarray(ee_orientation, dtype=np.float32)
-    gripper_width = float(joint_positions[7] + joint_positions[8])
-
-    return np.concatenate(
-        [
-            joint_positions[:7],
-            ee_position[:3],
-            ee_orientation[:4],
-            np.array([gripper_width], dtype=np.float32),
-        ]
-    ).astype(np.float32)
-
-
-def is_cube_inside_box(cube: DynamicCuboid) -> bool:
-    """判断指定方块是否已经被放进托盘。"""
-
-    cube_position, _ = cube.get_world_pose()
-    cube_position = np.asarray(cube_position, dtype=np.float32)
-
-    inner_half_x = PLACE_BOX_OUTER_X / 2.0 - PLACE_BOX_WALL_T
-    inner_half_y = PLACE_BOX_OUTER_Y / 2.0 - PLACE_BOX_WALL_T
-    within_x = abs(float(cube_position[0] - PLACE_BOX_CENTER[0])) < inner_half_x
-    within_y = abs(float(cube_position[1] - PLACE_BOX_CENTER[1])) < inner_half_y
-    within_z = float(cube_position[2]) < TABLE_SURFACE_Z + 0.12
-    return bool(within_x and within_y and within_z)
-
-
-def episode_metadata() -> str:
-    """生成每个 episode 共享的元数据字符串。"""
-
-    return json.dumps(
-        {
-            "schema_version": 1,
-            "task": TASK_DESCRIPTION,
-            "state_names": STATE_NAMES,
-            "action_names": ACTION_NAMES,
-            "front_camera_resolution": FRONT_CAMERA_RESOLUTION,
-            "wrist_camera_resolution": WRIST_CAMERA_RESOLUTION,
-            "episode_max_steps": EPISODE_MAX_STEPS,
-        },
-        ensure_ascii=False,
-        indent=2,
-    )
-
-
-def save_episode(
-    output_dir: Path,
-    episode_index: int,
-    front_images: list[np.ndarray],
-    wrist_images: list[np.ndarray],
-    states: list[np.ndarray],
-    actions: list[np.ndarray],
-    rewards: list[float],
-    dones: list[bool],
-    success: bool,
-    seed: int,
-) -> Path:
-    """把单个 episode 保存成压缩 npz。"""
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    file_path = output_dir / f"episode_{episode_index:05d}.npz"
-
-    np.savez_compressed(
-        file_path,
-        **{
-            "observation.images.front": np.asarray(front_images, dtype=np.uint8),
-            "observation.images.wrist": np.asarray(wrist_images, dtype=np.uint8),
-            "observation.state": np.asarray(states, dtype=np.float32),
-            "action": np.asarray(actions, dtype=np.float32),
-            "next.reward": np.asarray(rewards, dtype=np.float32),
-            "next.done": np.asarray(dones, dtype=np.bool_),
-            "state_names": np.asarray(STATE_NAMES),
-            "action_names": np.asarray(ACTION_NAMES),
-            "task": np.asarray(TASK_DESCRIPTION),
-            "success": np.asarray(success, dtype=np.bool_),
-            "episode_index": np.asarray(episode_index, dtype=np.int32),
-            "episode_seed": np.asarray(seed, dtype=np.int32),
-            "metadata_json": np.asarray(episode_metadata()),
-        },
-    )
-    return file_path
-
-
-def collect_episode(
+def reset_episode_from_npz(
     world: World,
     franka: SingleManipulator,
     cubes: dict[str, DynamicCuboid],
-    front_camera: Camera,
-    wrist_camera: Camera,
-    controller: RMPFlowController,
-    episode_index: int,
-    output_dir: Path,
-    seed: int,
-) -> tuple[bool, Path | None]:
-    """采集单个 episode。"""
+    episode_data: np.lib.npyio.NpzFile,
+    episode_path: Path,
+) -> int:
+    """根据 npz 里的 seed 重建 episode 起始场景。"""
+
+    if "episode_seed" in episode_data.files:
+        seed = int(episode_data["episode_seed"])
+    else:
+        seed = 20260603 + episode_index_from_path(episode_path)
 
     rng = np.random.default_rng(seed)
     cube_positions = sample_cube_positions(rng)
-    target_cube = cubes[TARGET_CUBE_NAME]
     reset_robot(franka)
     reset_cubes(cubes, cube_positions)
+    settle_scene(world, steps=20)
+    return seed
+
+
+def replay_episode(
+    world: World,
+    franka: SingleManipulator,
+    cubes: dict[str, DynamicCuboid],
+    controller: RMPFlowController,
+    episode_path: Path,
+    fps: float,
+) -> None:
+    """在 Isaac Sim 中回放单条 episode。
+
+    注意：
+    当前 raw npz 保存的是“动作真值”，不是每一帧完整物理世界状态。
+    所以这里是“动作重放”，不是像视频那样的严格逐帧状态复刻。
+    """
+
+    data = np.load(episode_path, allow_pickle=True)
+    actions = np.asarray(data["action"], dtype=np.float32)
+    done_flags = np.asarray(data["next.done"], dtype=np.bool_)
+    task = str(np.asarray(data["task"]).item())
+    seed = reset_episode_from_npz(world, franka, cubes, data, episode_path)
     controller.reset()
-    settle_scene(world, EPISODE_SETTLE_STEPS)
-
-    front_images: list[np.ndarray] = []
-    wrist_images: list[np.ndarray] = []
-    states: list[np.ndarray] = []
-    actions: list[np.ndarray] = []
-    rewards: list[float] = []
-    dones: list[bool] = []
-
-    done = False
-    success = False
+    target_cube = cubes[TARGET_CUBE_NAME]
     cube_attached = False
-    start_ee_position, _ = franka.end_effector.get_world_pose()
-    start_ee_position = np.asarray(start_ee_position, dtype=np.float32)
-    scripted_actions = build_scripted_actions(
-        start_ee_position=start_ee_position,
-        target_cube_position=cube_positions[TARGET_CUBE_NAME],
-    )
+    attach_offset = np.array([0.0, 0.0, -EE_PICK_Z_OFFSET], dtype=np.float32)
+    placement_step_index = 0
+    placement_start_position = PLACE_GOAL_POSITION.copy()
 
-    for task_space_action in scripted_actions[:EPISODE_MAX_STEPS]:
-        target_position = np.asarray(task_space_action[:3], dtype=np.float32)
-        gripper_closed = bool(float(task_space_action[3]) >= 0.5)
+    print(f"replay: {episode_path.name}", flush=True)
+    print(f"  task: {task}", flush=True)
+    print(f"  seed: {seed}", flush=True)
+    print(f"  frames: {len(actions)}", flush=True)
+
+    timestep = 1.0 / max(fps, 1e-6)
+    start = time.perf_counter()
+
+    for frame_idx, action in enumerate(actions):
+        if not simulation_app.is_running():
+            break
+
+        target_position = np.asarray(action[:3], dtype=np.float32)
+        gripper_closed = bool(float(action[3]) >= 0.5)
 
         arm_action = controller.forward(
             target_end_effector_position=target_position,
@@ -759,125 +586,86 @@ def collect_episode(
         franka.apply_action(joint_action)
         world.step(render=True)
 
-        if gripper_closed:
-            ee_position, _ = franka.end_effector.get_world_pose()
-            ee_position = np.asarray(ee_position, dtype=np.float32)
-            attached_cube_position = ee_position + np.array([0.0, 0.0, -EE_PICK_Z_OFFSET], dtype=np.float32)
-            target_cube.set_world_pose(
-                position=attached_cube_position,
-                orientation=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
-            )
-            target_cube.set_linear_velocity(np.zeros(3, dtype=np.float32))
-            target_cube.set_angular_velocity(np.zeros(3, dtype=np.float32))
+        ee_position, _ = franka.end_effector.get_world_pose()
+        ee_position = np.asarray(ee_position, dtype=np.float32)
+
+        if gripper_closed and not cube_attached:
+            attach_offset = np.array([0.0, 0.0, -EE_PICK_Z_OFFSET], dtype=np.float32)
             cube_attached = True
-        elif cube_attached:
+            placement_step_index = 0
+
+        if cube_attached and gripper_closed:
+            cube_position, _ = target_cube.get_world_pose()
+            cube_position = np.asarray(cube_position, dtype=np.float32)
+            attached_cube_position = ee_position + attach_offset
+            smoothed_cube_position = (
+                (1.0 - ATTACH_POSITION_BLEND) * cube_position + ATTACH_POSITION_BLEND * attached_cube_position
+            ).astype(np.float32)
             target_cube.set_world_pose(
-                position=PLACE_GOAL_POSITION.copy(),
+                position=smoothed_cube_position,
                 orientation=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
             )
             target_cube.set_linear_velocity(np.zeros(3, dtype=np.float32))
             target_cube.set_angular_velocity(np.zeros(3, dtype=np.float32))
+        elif cube_attached and not gripper_closed:
             cube_attached = False
+            cube_position, _ = target_cube.get_world_pose()
+            placement_start_position = np.asarray(cube_position, dtype=np.float32)
+            placement_step_index = 1
+        elif placement_step_index > 0:
+            alpha = min(placement_step_index / float(PLACE_SETTLE_STEPS), 1.0)
+            smooth_alpha = alpha * alpha * (3.0 - 2.0 * alpha)
+            settled_position = (
+                (1.0 - smooth_alpha) * placement_start_position + smooth_alpha * PLACE_GOAL_POSITION
+            ).astype(np.float32)
+            target_cube.set_world_pose(
+                position=settled_position,
+                orientation=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+            )
+            target_cube.set_linear_velocity(np.zeros(3, dtype=np.float32))
+            target_cube.set_angular_velocity(np.zeros(3, dtype=np.float32))
+            if placement_step_index < PLACE_SETTLE_STEPS:
+                placement_step_index += 1
+            else:
+                placement_step_index = 0
 
-        front_images.append(capture_rgb(front_camera))
-        wrist_images.append(capture_rgb(wrist_camera))
-        states.append(get_robot_state(franka))
-        actions.append(task_space_action)
+        target_time = start + (frame_idx + 1) * timestep
+        sleep_time = target_time - time.perf_counter()
+        if sleep_time > 0 and not ARGS.headless:
+            time.sleep(sleep_time)
 
-        success = is_cube_inside_box(target_cube)
-        rewards.append(1.0 if success else 0.0)
-        dones.append(False)
-
-        if not simulation_app.is_running():
+        if frame_idx < len(done_flags) and bool(done_flags[frame_idx]):
             break
 
-    if dones:
-        dones[-1] = True
-        done = True
-
-    final_cube_position, _ = target_cube.get_world_pose()
-    final_cube_position = np.asarray(final_cube_position, dtype=np.float32)
-
-    if not success:
-        print(
-            f"  red cube final position: {np.round(final_cube_position, 4).tolist()}",
-            flush=True,
-        )
-        return False, None
-
-    save_path = save_episode(
-        output_dir=output_dir,
-        episode_index=episode_index,
-        front_images=front_images,
-        wrist_images=wrist_images,
-        states=states,
-        actions=actions,
-        rewards=rewards,
-        dones=dones,
-        success=success,
-        seed=seed,
-    )
+    cube_position, _ = target_cube.get_world_pose()
+    ee_position, _ = franka.end_effector.get_world_pose()
     print(
-        f"  red cube final position: {np.round(final_cube_position, 4).tolist()}",
+        "  final:"
+        f" cube={np.round(np.asarray(cube_position, dtype=np.float32), 4).tolist()}"
+        f" ee={np.round(np.asarray(ee_position, dtype=np.float32), 4).tolist()}",
         flush=True,
     )
-    return success, save_path
 
 
 def main() -> None:
     """脚本主入口。"""
 
-    output_dir = ARGS.output_dir.resolve()
-
+    episode_path = resolve_episode_path(ARGS.raw_dir.resolve(), ARGS.episode)
     world, franka, cubes = build_scene()
     franka.initialize()
-    front_camera, wrist_camera = create_cameras()
-    settle_scene(world, 10)
+    create_cameras()
+    settle_scene(world, steps=10)
 
-    controller = RMPFlowController(
-        name="franka_scripted_rmpflow",
-        robot_articulation=franka,
-    )
+    controller = RMPFlowController(name="franka_replay_rmpflow", robot_articulation=franka)
 
-    success_count = 0
-    attempt_count = 0
-    max_attempts = max(ARGS.episodes * 12, ARGS.episodes + 5)
-
-    print(f"输出目录: {output_dir}", flush=True)
-    print(f"目标成功 episode 数: {ARGS.episodes}", flush=True)
-    print("开始采集，仅保存成功轨迹...", flush=True)
-
-    while success_count < ARGS.episodes and attempt_count < max_attempts:
-        episode_seed = 20260604 + attempt_count
-        success, save_path = collect_episode(
-            world=world,
-            franka=franka,
-            cubes=cubes,
-            front_camera=front_camera,
-            wrist_camera=wrist_camera,
-            controller=controller,
-            episode_index=success_count,
-            output_dir=output_dir,
-            seed=episode_seed,
-        )
-        if success:
-            print(
-                f"[attempt {attempt_count:03d}] success "
-                f"saved -> {save_path}",
-                flush=True,
-            )
-            success_count += 1
-        else:
-            print(f"[attempt {attempt_count:03d}] failed discarded", flush=True)
-        attempt_count += 1
-
-        if not simulation_app.is_running():
-            print("检测到 Isaac Sim 已关闭，提前结束采集。", flush=True)
-            break
-
-    print(f"采集完成：成功保存 {success_count} / 目标 {ARGS.episodes}，总尝试 {attempt_count}。", flush=True)
-    if success_count < ARGS.episodes:
-        print("警告：未达到目标成功条数，请再次运行采集。", flush=True)
+    try:
+        while simulation_app.is_running():
+            print("scene ready, start replay", flush=True)
+            replay_episode(world, franka, cubes, controller, episode_path, ARGS.fps)
+            if not ARGS.loop:
+                break
+    finally:
+        simulation_app.close()
 
 
 if __name__ == "__main__":
@@ -886,5 +674,3 @@ if __name__ == "__main__":
     except Exception:
         traceback.print_exc()
         raise
-    finally:
-        simulation_app.close()
