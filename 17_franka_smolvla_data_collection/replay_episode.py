@@ -128,9 +128,6 @@ HOME_JOINT_POSITIONS = np.array(
 )
 
 EE_TARGET_ORIENTATION = euler_angles_to_quat(np.array([0.0, np.pi, 0.0], dtype=np.float32))
-EE_PICK_Z_OFFSET = 0.092
-ATTACH_POSITION_BLEND = 0.22
-PLACE_SETTLE_STEPS = 12
 
 
 def create_camera_prim(
@@ -557,11 +554,6 @@ def replay_episode(
     seed = reset_episode_from_npz(world, franka, cubes, data, episode_path)
     controller.reset()
     target_cube = cubes[TARGET_CUBE_NAME]
-    cube_attached = False
-    attach_offset = np.array([0.0, 0.0, -EE_PICK_Z_OFFSET], dtype=np.float32)
-    placement_step_index = 0
-    placement_start_position = PLACE_GOAL_POSITION.copy()
-
     print(f"replay: {episode_path.name}", flush=True)
     print(f"  task: {task}", flush=True)
     print(f"  seed: {seed}", flush=True)
@@ -585,49 +577,6 @@ def replay_episode(
         joint_action = merge_joint_actions(franka.num_dof, arm_action, gripper_action)
         franka.apply_action(joint_action)
         world.step(render=True)
-
-        ee_position, _ = franka.end_effector.get_world_pose()
-        ee_position = np.asarray(ee_position, dtype=np.float32)
-
-        if gripper_closed and not cube_attached:
-            attach_offset = np.array([0.0, 0.0, -EE_PICK_Z_OFFSET], dtype=np.float32)
-            cube_attached = True
-            placement_step_index = 0
-
-        if cube_attached and gripper_closed:
-            cube_position, _ = target_cube.get_world_pose()
-            cube_position = np.asarray(cube_position, dtype=np.float32)
-            attached_cube_position = ee_position + attach_offset
-            smoothed_cube_position = (
-                (1.0 - ATTACH_POSITION_BLEND) * cube_position + ATTACH_POSITION_BLEND * attached_cube_position
-            ).astype(np.float32)
-            target_cube.set_world_pose(
-                position=smoothed_cube_position,
-                orientation=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
-            )
-            target_cube.set_linear_velocity(np.zeros(3, dtype=np.float32))
-            target_cube.set_angular_velocity(np.zeros(3, dtype=np.float32))
-        elif cube_attached and not gripper_closed:
-            cube_attached = False
-            cube_position, _ = target_cube.get_world_pose()
-            placement_start_position = np.asarray(cube_position, dtype=np.float32)
-            placement_step_index = 1
-        elif placement_step_index > 0:
-            alpha = min(placement_step_index / float(PLACE_SETTLE_STEPS), 1.0)
-            smooth_alpha = alpha * alpha * (3.0 - 2.0 * alpha)
-            settled_position = (
-                (1.0 - smooth_alpha) * placement_start_position + smooth_alpha * PLACE_GOAL_POSITION
-            ).astype(np.float32)
-            target_cube.set_world_pose(
-                position=settled_position,
-                orientation=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
-            )
-            target_cube.set_linear_velocity(np.zeros(3, dtype=np.float32))
-            target_cube.set_angular_velocity(np.zeros(3, dtype=np.float32))
-            if placement_step_index < PLACE_SETTLE_STEPS:
-                placement_step_index += 1
-            else:
-                placement_step_index = 0
 
         target_time = start + (frame_idx + 1) * timestep
         sleep_time = target_time - time.perf_counter()
