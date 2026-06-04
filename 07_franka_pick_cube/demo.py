@@ -38,8 +38,17 @@ def main():
         240: gripper_close_action(),
         320: arm_pose_action([0.0, -0.9, 0.0, -1.9, 0.0, 2.15, 0.8, 0.0, 0.0]),
     }
+    #获取cube的坐标
+    cube_prim = world.scene.get("/World/Cube")
+    cube_position = cube_prim.GetAttribute("xformOp:translate").Get()
+    print(f"Cube position: {cube_position}")
 
     for step in range(420):
+        #打印机械臂末端执行器的位置
+        ee_prim = world.scene.get("/World/Franka/ee_link")
+        ee_position = ee_prim.GetAttribute("xformOp:translate").Get()
+        print(f"Step {step}: End-effector position: {ee_position}")
+        
         if step in scripted_actions:
             robot.apply_action(scripted_actions[step])
         world.step(render=True)
