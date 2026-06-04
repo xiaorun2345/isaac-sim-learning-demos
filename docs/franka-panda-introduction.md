@@ -2,6 +2,10 @@
 
 ![Franka Panda 关节示意图](assets/franka-panda-joints-overview.png)
 
+夹爪局部坐标系、TCP 与手腕相机的实物风格对照说明：
+
+- [Franka Panda 夹爪坐标系对照讲解](franka-panda-hand-frame-guide.md)
+
 Franka Panda 是一款常见的协作机械臂。它经常用于机器人教学、抓取实验、视觉操作、模仿学习和具身智能研究。在本项目中，Demo `05-08` 使用的就是 Franka Panda。
 
 ## 1. 先认识机械臂的组成
