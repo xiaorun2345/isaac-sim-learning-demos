@@ -1,6 +1,6 @@
 # Isaac Sim Learning Demos
 
-This repository contains 18 progressive Python demos for learning:
+This repository contains 19 progressive Python demos for learning:
 
 - Isaac Sim standalone Python scripting
 - Scene building and sensors
@@ -34,11 +34,12 @@ This repository contains 18 progressive Python demos for learning:
 16. `16_franka_ros2_camera_demo`
 17. `17_franka_smolvla_data_collection`
 18. `18_franka_isaac_lab_mimic`
+19. `19_franka_multi_station_scene`
 
 ## Repository Layout
 
 - `common/`: shared helpers
-- `01_*` to `18_*`: one demo folder per lesson
+- `01_*` to `19_*`: one demo folder per lesson
 - `docs/superpowers/`: design and plan documents
 - [`docs/franka-panda-introduction.md`](docs/franka-panda-introduction.md): illustrated Franka Panda beginner guide
 - [`docs/franka-panda-hand-frame-guide.md`](docs/franka-panda-hand-frame-guide.md): realistic gripper frame, TCP, and wrist-camera guide
@@ -72,5 +73,6 @@ Run `11-15` from an Isaac Lab environment that can import both Isaac Lab and the
 - Demo `16` includes a full Franka scene plus a ROS 2 front-camera image subscriber example.
 - Demo `17` generates dual-camera scripted-expert data for SmolVLA-style training.
 - Demo `18` migrates Demo 17's scene into a complete Isaac Lab Mimic environment and BC-RNN pipeline.
+- Demo `19` replicates the Franka workcell into a 4-6 station multi-env scene for easier parallel data collection.
 - Demos `13-15` include offline walkthroughs plus real GR00T N1.7 `PolicyClient` examples.
 - Real GR00T observation and action keys must match the embodiment configuration selected on the policy server.
