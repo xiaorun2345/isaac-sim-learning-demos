@@ -128,6 +128,21 @@ HOME_JOINT_POSITIONS = np.array(
 )
 
 EE_TARGET_ORIENTATION = euler_angles_to_quat(np.array([0.0, np.pi, 0.0], dtype=np.float32))
+EE_PICK_Z_OFFSET = 0.092
+EE_FEEDBACK_Z_BIAS = 0.0985
+EE_GENERAL_REACH_XY_THRESHOLD = 0.030
+EE_GENERAL_REACH_Z_THRESHOLD = 0.030
+EE_PICK_REACH_XY_THRESHOLD = 0.015
+EE_PICK_REACH_Z_THRESHOLD = 0.020
+EE_PLACE_REACH_XY_THRESHOLD = 0.040
+EE_PLACE_REACH_Z_THRESHOLD = 0.150
+GRIPPER_CLOSE_WIDTH_THRESHOLD = 0.065
+PICK_ATTACH_XY_THRESHOLD = 0.015
+PICK_ATTACH_Z_THRESHOLD = 0.020
+PLACE_RELEASE_XY_THRESHOLD = 0.040
+PLACE_RELEASE_Z_THRESHOLD = 0.150
+ATTACH_POSITION_BLEND = 0.35
+PLACE_SETTLE_STEPS = 20
 
 
 def create_camera_prim(
@@ -492,6 +507,46 @@ def _merge_single_field(
             target[int(index)] = float(value)
 
 
+def planar_distance(a: np.ndarray, b: np.ndarray) -> float:
+    """计算 XY 平面距离。"""
+
+    a = np.asarray(a, dtype=np.float32)
+    b = np.asarray(b, dtype=np.float32)
+    return float(np.linalg.norm(a[:2] - b[:2]))
+
+
+def vertical_distance(a: np.ndarray, b: np.ndarray) -> float:
+    """计算 Z 方向绝对距离。"""
+
+    a = np.asarray(a, dtype=np.float32)
+    b = np.asarray(b, dtype=np.float32)
+    return float(abs(a[2] - b[2]))
+
+
+def is_position_close(
+    current_position: np.ndarray,
+    target_position: np.ndarray,
+    xy_threshold: float,
+    z_threshold: float,
+) -> bool:
+    """按 XY 和 Z 分开判断是否真正到位。"""
+
+    return bool(
+        planar_distance(current_position, target_position) <= xy_threshold
+        and vertical_distance(current_position, target_position) <= z_threshold
+    )
+
+
+def get_task_space_ee_pose(franka: SingleManipulator) -> tuple[np.ndarray, np.ndarray]:
+    """读取与录制动作同一参考系下的末端位姿。"""
+
+    ee_position, ee_orientation = franka.end_effector.get_world_pose()
+    ee_position = np.asarray(ee_position, dtype=np.float32).copy()
+    ee_position[2] -= EE_FEEDBACK_Z_BIAS
+    ee_orientation = np.asarray(ee_orientation, dtype=np.float32)
+    return ee_position, ee_orientation
+
+
 def episode_index_from_path(path: Path) -> int:
     """从 episode 文件名里解析数字编号。"""
 
@@ -554,6 +609,11 @@ def replay_episode(
     seed = reset_episode_from_npz(world, franka, cubes, data, episode_path)
     controller.reset()
     target_cube = cubes[TARGET_CUBE_NAME]
+    cube_attached = False
+    attach_offset = np.array([0.0, 0.0, -EE_PICK_Z_OFFSET], dtype=np.float32)
+    placement_step_index = 0
+    placement_start_position = PLACE_GOAL_POSITION.copy()
+
     print(f"replay: {episode_path.name}", flush=True)
     print(f"  task: {task}", flush=True)
     print(f"  seed: {seed}", flush=True)
@@ -577,6 +637,104 @@ def replay_episode(
         joint_action = merge_joint_actions(franka.num_dof, arm_action, gripper_action)
         franka.apply_action(joint_action)
         world.step(render=True)
+
+        ee_position, _ = get_task_space_ee_pose(franka)
+        cube_position, _ = target_cube.get_world_pose()
+        cube_position = np.asarray(cube_position, dtype=np.float32)
+        joint_positions = np.asarray(franka.get_joint_positions(), dtype=np.float32)
+        gripper_width = float(joint_positions[7] + joint_positions[8])
+        desired_cube_position = ee_position + attach_offset
+        if gripper_closed:
+            ee_reached_target = is_position_close(
+                ee_position,
+                target_position,
+                EE_PICK_REACH_XY_THRESHOLD,
+                EE_PICK_REACH_Z_THRESHOLD,
+            )
+        else:
+            ee_reached_target = is_position_close(
+                ee_position,
+                target_position,
+                EE_PLACE_REACH_XY_THRESHOLD,
+                EE_PLACE_REACH_Z_THRESHOLD,
+            )
+
+        if gripper_closed and not cube_attached:
+            cube_ready_to_attach = is_position_close(
+                cube_position,
+                desired_cube_position,
+                PICK_ATTACH_XY_THRESHOLD,
+                PICK_ATTACH_Z_THRESHOLD,
+            )
+            if ee_reached_target and cube_ready_to_attach and gripper_width <= GRIPPER_CLOSE_WIDTH_THRESHOLD:
+                attach_offset = np.array([0.0, 0.0, -EE_PICK_Z_OFFSET], dtype=np.float32)
+                cube_attached = True
+                placement_step_index = 0
+
+        if cube_attached and gripper_closed:
+            smoothed_cube_position = (
+                (1.0 - ATTACH_POSITION_BLEND) * cube_position + ATTACH_POSITION_BLEND * desired_cube_position
+            ).astype(np.float32)
+            target_cube.set_world_pose(
+                position=smoothed_cube_position,
+                orientation=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+            )
+            target_cube.set_linear_velocity(np.zeros(3, dtype=np.float32))
+            target_cube.set_angular_velocity(np.zeros(3, dtype=np.float32))
+        elif cube_attached and not gripper_closed:
+            cube_ready_to_release = is_position_close(
+                desired_cube_position,
+                PLACE_GOAL_POSITION,
+                PLACE_RELEASE_XY_THRESHOLD,
+                PLACE_RELEASE_Z_THRESHOLD,
+            )
+            carried_cube_position = (
+                (1.0 - ATTACH_POSITION_BLEND) * cube_position + ATTACH_POSITION_BLEND * desired_cube_position
+            ).astype(np.float32)
+            if ee_reached_target and cube_ready_to_release:
+                if placement_step_index == 0:
+                    placement_start_position = carried_cube_position.copy()
+                    placement_step_index = 1
+                alpha = min(placement_step_index / float(PLACE_SETTLE_STEPS), 1.0)
+                smooth_alpha = alpha * alpha * (3.0 - 2.0 * alpha)
+                settled_position = (
+                    (1.0 - smooth_alpha) * placement_start_position + smooth_alpha * PLACE_GOAL_POSITION
+                ).astype(np.float32)
+                target_cube.set_world_pose(
+                    position=settled_position,
+                    orientation=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+                )
+                target_cube.set_linear_velocity(np.zeros(3, dtype=np.float32))
+                target_cube.set_angular_velocity(np.zeros(3, dtype=np.float32))
+                if placement_step_index < PLACE_SETTLE_STEPS:
+                    placement_step_index += 1
+                else:
+                    placement_step_index = 0
+                    cube_attached = False
+            else:
+                placement_step_index = 0
+                target_cube.set_world_pose(
+                    position=carried_cube_position,
+                    orientation=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+                )
+                target_cube.set_linear_velocity(np.zeros(3, dtype=np.float32))
+                target_cube.set_angular_velocity(np.zeros(3, dtype=np.float32))
+        elif placement_step_index > 0:
+            alpha = min(placement_step_index / float(PLACE_SETTLE_STEPS), 1.0)
+            smooth_alpha = alpha * alpha * (3.0 - 2.0 * alpha)
+            settled_position = (
+                (1.0 - smooth_alpha) * placement_start_position + smooth_alpha * PLACE_GOAL_POSITION
+            ).astype(np.float32)
+            target_cube.set_world_pose(
+                position=settled_position,
+                orientation=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+            )
+            target_cube.set_linear_velocity(np.zeros(3, dtype=np.float32))
+            target_cube.set_angular_velocity(np.zeros(3, dtype=np.float32))
+            if placement_step_index < PLACE_SETTLE_STEPS:
+                placement_step_index += 1
+            else:
+                placement_step_index = 0
 
         target_time = start + (frame_idx + 1) * timestep
         sleep_time = target_time - time.perf_counter()
