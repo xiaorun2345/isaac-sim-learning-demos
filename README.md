@@ -73,6 +73,7 @@ Run `11-15` from an Isaac Lab environment that can import both Isaac Lab and the
 - Demo `16` includes a full Franka scene plus a ROS 2 front-camera image subscriber example.
 - Demo `17` generates dual-camera scripted-expert data for SmolVLA-style training.
 - Demo `18` migrates Demo 17's scene into a complete Isaac Lab Mimic environment and BC-RNN pipeline.
+- `18_franka_action_smoothness_eval` provides an offline smoothness report for Demo 17 trajectories.
 - Demo `19` replicates the Franka workcell into a 4-6 station multi-env scene for easier parallel data collection.
 - Demos `13-15` include offline walkthroughs plus real GR00T N1.7 `PolicyClient` examples.
 - Real GR00T observation and action keys must match the embodiment configuration selected on the policy server.
