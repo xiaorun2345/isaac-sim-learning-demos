@@ -68,6 +68,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episodes", type=int, default=20, help="采集多少个 episode。")
     parser.add_argument("--headless", action="store_true", help="无界面运行。")
     parser.add_argument(
+        "--capture-every",
+        type=int,
+        default=2,
+        help="每隔多少个仿真 step 记录一帧。默认 2，可明显提升采集速度。",
+    )
+    parser.add_argument(
+        "--compress",
+        action="store_true",
+        help="是否使用 np.savez_compressed 压缩保存。默认关闭以提升写盘速度。",
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path(__file__).resolve().parent / "outputs" / "raw",
@@ -154,6 +165,8 @@ WRIST_CAMERA_RESOLUTION = (640, 480)
 CAMERA_FREQUENCY = 20
 CAMERA_WARMUP_STEPS = 20
 CAMERA_CAPTURE_RETRIES = 6
+DEBUG_PRINT_EVERY_STEPS = 8
+CAPTURE_EVERY_STEPS = max(1, int(ARGS.capture_every))
 
 # 训练方块尺寸。
 CUBE_SIZE = np.array([0.045, 0.045, 0.045], dtype=np.float32)
@@ -170,10 +183,27 @@ DISTRACTOR_CUBE_SPECS = [
     ("cube_blue", np.array([0.12, 0.36, 0.86], dtype=np.float32)),
 ]
 
-# 红色目标方块被限制在一个很小的稳定区域内采样。
-# 这是“先保证专家成功率，再逐步扩大随机化”的思路。
-TARGET_CUBE_X_RANGE = (0.42, 0.44)
-TARGET_CUBE_Y_RANGE = (-0.02, 0.02)
+# 红色目标方块不再只在一个小矩形里随机，而是改成“多个桌面分区随机抽样”。
+#
+# 这样做有两个目的：
+# 1. 让抓取样本尽量覆盖桌面各个角落，提升泛化性
+# 2. 仍把采样限制在 Franka 相对稳定、可达的工作区里
+#
+# 每个区域格式都是：
+# `(区域名, (x_min, x_max), (y_min, y_max))`
+TARGET_CUBE_SPAWN_REGIONS = [
+    ("left_front", (0.28, 0.38), (0.12, 0.26)),
+    ("left_mid", (0.28, 0.40), (-0.08, 0.10)),
+    ("left_back", (0.28, 0.38), (-0.26, -0.12)),
+    ("center_front", (0.42, 0.54), (0.02, 0.16)),
+    ("center_back", (0.42, 0.58), (-0.24, -0.08)),
+    ("right_back", (0.56, 0.66), (-0.26, -0.10)),
+]
+# 采样时要明确避开托盘内侧，并给一个额外安全边界，避免 cube 刚好刷在盒子边上。
+TARGET_CUBE_BOX_EXCLUSION_MARGIN = 0.045
+# 也避免太贴近两个固定干扰方块，否则一开始就可能发生重叠或碰撞。
+TARGET_CUBE_DISTRACTOR_CLEARANCE_XY = 0.080
+TARGET_CUBE_SAMPLE_MAX_TRIES = 80
 
 # 两个干扰方块固定在左右两侧，只做视觉干扰，不直接挡住抓取路径。
 DISTRACTOR_CUBE_LAYOUT = {
@@ -204,8 +234,18 @@ HOME_JOINT_POSITIONS = np.array(
 )
 EE_TARGET_ORIENTATION = euler_angles_to_quat(np.array([0.0, np.pi, 0.0], dtype=np.float32))
 
-EE_PICK_Z_OFFSET = 0.092
-EE_PLACE_Z_OFFSET = 0.110
+# 抓取和放置各自拆成“靠近高度”和“真正执行高度”两层：
+# - `*_APPROACH_*`：更安全，先把末端带到目标附近
+# - `*_ACTION_*`  ：真正闭爪 / 松爪时所在的高度
+#
+# 这样可以避免机械臂还离 cube 中心较远时就闭爪，也能让放置阶段明显下探到托盘内。
+# 这里继续把抓取高度压低：
+# - `EE_PICK_APPROACH_Z_OFFSET` 先降到更贴近 cube 的预抓取位
+# - `EE_PICK_ACTION_Z_OFFSET`   再降到接近 cube 中心附近的位置闭爪
+EE_PICK_APPROACH_Z_OFFSET = 0.060
+EE_PICK_ACTION_Z_OFFSET = 0.013
+EE_PLACE_APPROACH_Z_OFFSET = 0.110
+EE_PLACE_ACTION_Z_OFFSET = 0.085
 EE_HOVER_MARGIN = 0.140
 
 # `controller.forward()` 使用的任务空间控制点，与
@@ -225,19 +265,30 @@ EE_FEEDBACK_Z_BIAS = 0.0985
 GRASP_HOLD_STEPS = 26
 RELEASE_HOLD_STEPS = 26
 PHASE_STABLE_FRAMES = 2
+PRE_GRASP_STABLE_FRAMES = 6
+CLOSE_GRIPPER_STABLE_FRAMES = 4
+PRE_RELEASE_STABLE_FRAMES = 4
+OPEN_GRIPPER_STABLE_FRAMES = 4
+# 为了避免某些 Isaac 版本里夹爪宽度反馈稍有偏差，抓取 / 松爪阶段除了宽度阈值，
+# 再额外给一小段“命令生效时间”作为兜底。
+GRASP_CLOSE_COMMAND_STEPS = 10
+RELEASE_OPEN_COMMAND_STEPS = 10
+POST_RELEASE_WAIT_STEPS = 12
 EE_GENERAL_REACH_XY_THRESHOLD = 0.030
 EE_GENERAL_REACH_Z_THRESHOLD = 0.030
 EE_PICK_REACH_XY_THRESHOLD = 0.015
 EE_PICK_REACH_Z_THRESHOLD = 0.020
+EE_GRASP_ALIGN_XY_THRESHOLD = 0.008
+EE_GRASP_ALIGN_Z_THRESHOLD = 0.012
 EE_PLACE_REACH_XY_THRESHOLD = 0.040
 EE_PLACE_REACH_Z_THRESHOLD = 0.150
 GRIPPER_CLOSE_WIDTH_THRESHOLD = 0.065
-PICK_ATTACH_XY_THRESHOLD = 0.015
-PICK_ATTACH_Z_THRESHOLD = 0.020
-PLACE_RELEASE_XY_THRESHOLD = 0.040
-PLACE_RELEASE_Z_THRESHOLD = 0.150
-ATTACHED_CUBE_BLEND = 0.35
-PLACE_SETTLE_STEPS = 20
+# 下面这组阈值不再用于“吸附”，而是只用于判定：
+# cube 是否真的被物理夹住并抬离桌面。
+GRASP_VERIFY_XY_THRESHOLD = 0.020
+GRASP_VERIFY_Z_THRESHOLD = 0.030
+GRASP_LIFT_MIN_HEIGHT = 0.010
+GRIPPER_OPEN_WIDTH_THRESHOLD = 0.085
 
 EPISODE_MAX_STEPS = 520
 EPISODE_SETTLE_STEPS = 20
@@ -598,19 +649,49 @@ def create_cameras() -> tuple[Camera, Camera]:
 def sample_cube_positions(rng: np.random.Generator) -> dict[str, np.ndarray]:
     """采样三色方块的位置。
 
-    红色方块是唯一抓取目标，因此放在最稳的抓取区。
-    绿色和蓝色方块是固定干扰物，不参与采样。
+    红色方块是唯一抓取目标，因此这里专门做“多区域采样 + 排除约束”：
+    1. 先随机选一个桌面分区
+    2. 再在该分区内均匀采样
+    3. 如果样本落进托盘区域，或者太靠近固定干扰块，就重采
+
+    这样既能明显扩大分布范围，也不会一开始就把方块刷进盒子里。
     """
 
-    return {
-        TARGET_CUBE_NAME: np.array(
+    for _ in range(TARGET_CUBE_SAMPLE_MAX_TRIES):
+        _, x_range, y_range = TARGET_CUBE_SPAWN_REGIONS[rng.integers(len(TARGET_CUBE_SPAWN_REGIONS))]
+        target_position = np.array(
             [
-                rng.uniform(*TARGET_CUBE_X_RANGE),
-                rng.uniform(*TARGET_CUBE_Y_RANGE),
+                rng.uniform(*x_range),
+                rng.uniform(*y_range),
                 TABLE_SURFACE_Z + CUBE_HALF_Z,
             ],
             dtype=np.float32,
         )
+        # 托盘外边框加一点 margin 后，一律不允许作为初始采样点。
+        inside_box_x = abs(float(target_position[0] - PLACE_BOX_CENTER[0])) <= (
+            PLACE_BOX_OUTER_X / 2.0 + TARGET_CUBE_BOX_EXCLUSION_MARGIN
+        )
+        inside_box_y = abs(float(target_position[1] - PLACE_BOX_CENTER[1])) <= (
+            PLACE_BOX_OUTER_Y / 2.0 + TARGET_CUBE_BOX_EXCLUSION_MARGIN
+        )
+        if inside_box_x and inside_box_y:
+            continue
+
+        # 同时避开固定干扰块，防止 reset 时直接和障碍块太近。
+        too_close_to_distractor = False
+        for distractor_position in DISTRACTOR_CUBE_LAYOUT.values():
+            if planar_distance(target_position, distractor_position) < TARGET_CUBE_DISTRACTOR_CLEARANCE_XY:
+                too_close_to_distractor = True
+                break
+        if too_close_to_distractor:
+            continue
+
+        return {TARGET_CUBE_NAME: target_position}
+
+    # 理论上前面的多区域采样应该很容易成功。
+    # 如果连续多次都撞上排除条件，就退回一个保底点，避免 episode 直接报错。
+    return {
+        TARGET_CUBE_NAME: np.array([0.46, -0.18, TABLE_SURFACE_Z + CUBE_HALF_Z], dtype=np.float32)
     }
 
 
@@ -701,27 +782,47 @@ def build_phase_targets(
     2. 机械臂还没到托盘上方就提前放置方块
     """
 
-    # 抓取点：XY 对准方块中心，Z 在方块中心之上加一个抓取偏移。
-    pick_position = np.array(
+    # 抓取分两层：
+    # 1. `pick_approach_position` 先下降到较稳的预抓取高度
+    # 2. `pick_grasp_position` 再进一步贴近 cube 中心，之后才闭爪
+    pick_approach_position = np.array(
         [
             float(target_cube_position[0]),
             float(target_cube_position[1]),
-            float(target_cube_position[2] + EE_PICK_Z_OFFSET),
+            float(target_cube_position[2] + EE_PICK_APPROACH_Z_OFFSET),
         ],
         dtype=np.float32,
     )
-    pick_hover_position = pick_position + np.array([0.0, 0.0, EE_HOVER_MARGIN], dtype=np.float32)
+    pick_grasp_position = np.array(
+        [
+            float(target_cube_position[0]),
+            float(target_cube_position[1]),
+            float(target_cube_position[2] + EE_PICK_ACTION_Z_OFFSET),
+        ],
+        dtype=np.float32,
+    )
+    pick_hover_position = pick_approach_position + np.array([0.0, 0.0, EE_HOVER_MARGIN], dtype=np.float32)
 
-    # 放置点：XY 对准托盘目标位置，Z 在托盘目标上方加一个放置偏移。
-    place_position = np.array(
+    # 放置也分两层：
+    # 1. `place_approach_position` 先移动到托盘上方
+    # 2. `place_release_position` 再下探到更低的位置执行松爪
+    place_approach_position = np.array(
         [
             float(PLACE_GOAL_POSITION[0]),
             float(PLACE_GOAL_POSITION[1]),
-            float(PLACE_GOAL_POSITION[2] + EE_PLACE_Z_OFFSET),
+            float(PLACE_GOAL_POSITION[2] + EE_PLACE_APPROACH_Z_OFFSET),
         ],
         dtype=np.float32,
     )
-    place_hover_position = place_position + np.array([0.0, 0.0, EE_HOVER_MARGIN], dtype=np.float32)
+    place_release_position = np.array(
+        [
+            float(PLACE_GOAL_POSITION[0]),
+            float(PLACE_GOAL_POSITION[1]),
+            float(PLACE_GOAL_POSITION[2] + EE_PLACE_ACTION_Z_OFFSET),
+        ],
+        dtype=np.float32,
+    )
+    place_hover_position = place_approach_position + np.array([0.0, 0.0, EE_HOVER_MARGIN], dtype=np.float32)
 
     current_position = np.asarray(start_ee_position, dtype=np.float32)
     # 每一个阶段都包含：
@@ -730,12 +831,16 @@ def build_phase_targets(
     # - gripper_closed：这一阶段夹爪应该是张开还是闭合
     return [
         {"name": "approach_pick_hover", "target": pick_hover_position, "gripper_closed": False},
-        {"name": "descend_pick", "target": pick_position, "gripper_closed": False},
-        {"name": "grasp", "target": pick_position, "gripper_closed": True},
+        {"name": "descend_pick", "target": pick_approach_position, "gripper_closed": False},
+        {"name": "pre_grasp_settle", "target": pick_grasp_position, "gripper_closed": False},
+        {"name": "grasp_close", "target": pick_grasp_position, "gripper_closed": True},
+        {"name": "grasp_hold", "target": pick_grasp_position, "gripper_closed": True},
         {"name": "lift", "target": pick_hover_position, "gripper_closed": True},
         {"name": "transfer", "target": place_hover_position, "gripper_closed": True},
-        {"name": "descend_place", "target": place_position, "gripper_closed": True},
-        {"name": "release", "target": place_position, "gripper_closed": False},
+        {"name": "descend_place", "target": place_approach_position, "gripper_closed": True},
+        {"name": "pre_release_settle", "target": place_release_position, "gripper_closed": True},
+        {"name": "release_open", "target": place_release_position, "gripper_closed": False},
+        {"name": "post_release_settle", "target": place_release_position, "gripper_closed": False},
         {"name": "retreat", "target": place_hover_position, "gripper_closed": False},
         {"name": "return_idle", "target": current_position, "gripper_closed": False},
     ]
@@ -761,6 +866,12 @@ def position_distance(a: np.ndarray, b: np.ndarray) -> float:
     """计算两个三维点之间的欧氏距离。"""
 
     return float(np.linalg.norm(np.asarray(a, dtype=np.float32) - np.asarray(b, dtype=np.float32)))
+
+
+def rounded_list(array: np.ndarray, decimals: int = 4) -> list[float]:
+    """把向量整理成更适合终端调试查看的短列表。"""
+
+    return np.round(np.asarray(array, dtype=np.float32), decimals).tolist()
 
 
 def planar_distance(a: np.ndarray, b: np.ndarray) -> float:
@@ -805,9 +916,11 @@ def phase_reach_thresholds(phase_name: str) -> tuple[float, float]:
     2. 抓取下降和放置下降必须更严格，否则会在还没真正靠近物体时提前切阶段
     """
 
-    if phase_name in {"descend_pick", "grasp"}:
+    if phase_name == "pre_grasp_settle":
+        return EE_GRASP_ALIGN_XY_THRESHOLD, EE_GRASP_ALIGN_Z_THRESHOLD
+    if phase_name in {"descend_pick", "grasp_close", "grasp_hold"}:
         return EE_PICK_REACH_XY_THRESHOLD, EE_PICK_REACH_Z_THRESHOLD
-    if phase_name in {"descend_place", "release"}:
+    if phase_name in {"descend_place", "pre_release_settle", "release_open", "post_release_settle"}:
         return EE_PLACE_REACH_XY_THRESHOLD, EE_PLACE_REACH_Z_THRESHOLD
     return EE_GENERAL_REACH_XY_THRESHOLD, EE_GENERAL_REACH_Z_THRESHOLD
 
@@ -919,6 +1032,8 @@ def episode_metadata() -> str:
             "front_camera_resolution": FRONT_CAMERA_RESOLUTION,
             "wrist_camera_resolution": WRIST_CAMERA_RESOLUTION,
             "episode_max_steps": EPISODE_MAX_STEPS,
+            "capture_every_steps": CAPTURE_EVERY_STEPS,
+            "save_compressed": bool(ARGS.compress),
         },
         ensure_ascii=False,
         indent=2,
@@ -937,29 +1052,34 @@ def save_episode(
     success: bool,
     seed: int,
 ) -> Path:
-    """把单个 episode 保存成压缩 npz。"""
+    """把单个 episode 保存成 npz。
+
+    默认使用非压缩 `np.savez`，因为两路 RGB 图像做 zip 压缩会显著拖慢采集速度。
+    如果更在意磁盘占用，可以用 `--compress` 切回压缩保存。
+    """
 
     output_dir.mkdir(parents=True, exist_ok=True)
     file_path = output_dir / f"episode_{episode_index:05d}.npz"
 
-    np.savez_compressed(
-        file_path,
-        **{
-            "observation.images.front": np.asarray(front_images, dtype=np.uint8),
-            "observation.images.wrist": np.asarray(wrist_images, dtype=np.uint8),
-            "observation.state": np.asarray(states, dtype=np.float32),
-            "action": np.asarray(actions, dtype=np.float32),
-            "next.reward": np.asarray(rewards, dtype=np.float32),
-            "next.done": np.asarray(dones, dtype=np.bool_),
-            "state_names": np.asarray(STATE_NAMES),
-            "action_names": np.asarray(ACTION_NAMES),
-            "task": np.asarray(TASK_DESCRIPTION),
-            "success": np.asarray(success, dtype=np.bool_),
-            "episode_index": np.asarray(episode_index, dtype=np.int32),
-            "episode_seed": np.asarray(seed, dtype=np.int32),
-            "metadata_json": np.asarray(episode_metadata()),
-        },
-    )
+    payload = {
+        "observation.images.front": np.asarray(front_images, dtype=np.uint8),
+        "observation.images.wrist": np.asarray(wrist_images, dtype=np.uint8),
+        "observation.state": np.asarray(states, dtype=np.float32),
+        "action": np.asarray(actions, dtype=np.float32),
+        "next.reward": np.asarray(rewards, dtype=np.float32),
+        "next.done": np.asarray(dones, dtype=np.bool_),
+        "state_names": np.asarray(STATE_NAMES),
+        "action_names": np.asarray(ACTION_NAMES),
+        "task": np.asarray(TASK_DESCRIPTION),
+        "success": np.asarray(success, dtype=np.bool_),
+        "episode_index": np.asarray(episode_index, dtype=np.int32),
+        "episode_seed": np.asarray(seed, dtype=np.int32),
+        "metadata_json": np.asarray(episode_metadata()),
+    }
+    if ARGS.compress:
+        np.savez_compressed(file_path, **payload)
+    else:
+        np.savez(file_path, **payload)
     return file_path
 
 
@@ -1003,9 +1123,6 @@ def collect_episode(
     # `done` / `success` 是这条 episode 的总体状态。
     done = False
     success = False
-    # `cube_attached` 不是吸附作弊，而是表示“当前判定为已经抓住方块，
-    # 需要在抓取保持与释放阶段用平滑方式跟随末端”。
-    cube_attached = False
     start_ee_position, _ = get_task_space_ee_pose(franka)
     phase_targets = build_phase_targets(
         start_ee_position=start_ee_position,
@@ -1016,18 +1133,38 @@ def collect_episode(
     phase_reached_frames = 0
     grasp_hold_frames = 0
     release_hold_frames = 0
-    place_settle_step = 0
-    attach_offset = np.array([0.0, 0.0, -EE_PICK_Z_OFFSET], dtype=np.float32)
-    release_start_position = PLACE_GOAL_POSITION.copy()
+    debug_step_index = 0
+    previous_phase_name = ""
+    phase_elapsed_frames = 0
+    # 这里的参考偏移要和真正闭爪时的抓取高度一致，
+    # 否则“cube 是否跟在末端下方”的物理判定会偏高。
+    attach_offset = np.array([0.0, 0.0, -EE_PICK_ACTION_Z_OFFSET], dtype=np.float32)
+
+    print(
+        f"[episode {episode_index:03d}]"
+        f" sampled_target_cube={rounded_list(cube_positions[TARGET_CUBE_NAME])}"
+        f" place_goal={rounded_list(PLACE_GOAL_POSITION)}"
+        f" start_ee={rounded_list(start_ee_position)}",
+        flush=True,
+    )
 
     # 逐帧推进。不是按固定阶段时长硬切，而是最多给到 `EPISODE_MAX_STEPS` 帧。
     for _ in range(EPISODE_MAX_STEPS):
+        debug_step_index += 1
         if phase_index >= len(phase_targets):
             break
 
         # 当前阶段描述。
         phase = phase_targets[phase_index]
         phase_name = str(phase["name"])
+        if phase_name != previous_phase_name:
+            phase_elapsed_frames = 0
+            print(
+                f"[episode {episode_index:03d}] enter_phase={phase_name}"
+                f" target={rounded_list(np.asarray(phase['target'], dtype=np.float32))}",
+                flush=True,
+            )
+            previous_phase_name = phase_name
         target_position = np.asarray(phase["target"], dtype=np.float32)
         gripper_closed = bool(phase["gripper_closed"])
         task_space_action = make_task_space_action(target_position, gripper_closed)
@@ -1044,6 +1181,7 @@ def collect_episode(
         joint_action = merge_joint_actions(franka.num_dof, arm_action, gripper_action)
         franka.apply_action(joint_action)
         world.step(render=True)
+        phase_elapsed_frames += 1
 
         # 读取当前末端位置和方块位置，用于阶段判定和几何检查。
         ee_position, _ = get_task_space_ee_pose(franka)
@@ -1060,85 +1198,73 @@ def collect_episode(
             ee_reach_xy_threshold,
             ee_reach_z_threshold,
         )
-        cube_ready_to_attach = is_position_close(
+        # “真正抓住”不再通过 set_world_pose 吸附来决定，
+        # 而是要求 cube 满足两个物理迹象：
+        # 1. 它仍然跟在末端下方
+        # 2. 它已经明显抬离桌面
+        cube_following_ee = is_position_close(
             cube_position,
             desired_cube_position,
-            PICK_ATTACH_XY_THRESHOLD,
-            PICK_ATTACH_Z_THRESHOLD,
+            GRASP_VERIFY_XY_THRESHOLD,
+            GRASP_VERIFY_Z_THRESHOLD,
         )
-        cube_ready_to_release = is_position_close(
-            desired_cube_position,
-            PLACE_GOAL_POSITION,
-            PLACE_RELEASE_XY_THRESHOLD,
-            PLACE_RELEASE_Z_THRESHOLD,
+        cube_lifted_from_table = float(cube_position[2] - (TABLE_SURFACE_Z + CUBE_HALF_Z)) >= GRASP_LIFT_MIN_HEIGHT
+        cube_grasped_by_physics = (
+            gripper_width <= GRIPPER_CLOSE_WIDTH_THRESHOLD
+            and cube_following_ee
+            and cube_lifted_from_table
         )
-
-        # 如果已经抓住方块，并且当前不是释放阶段，就让方块平滑跟随末端。
-        if cube_attached and phase_name != "release":
-            smoothed_cube_position = (
-                (1.0 - ATTACHED_CUBE_BLEND) * cube_position + ATTACHED_CUBE_BLEND * desired_cube_position
-            ).astype(np.float32)
-            target_cube.set_world_pose(
-                position=smoothed_cube_position,
-                orientation=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
-            )
-            target_cube.set_linear_velocity(np.zeros(3, dtype=np.float32))
-            target_cube.set_angular_velocity(np.zeros(3, dtype=np.float32))
-        # 抓取阶段：只有当末端够接近、夹爪够闭合、方块位置也合理时，
-        # 才判定为“已经抓住”。
-        elif not cube_attached and phase_name == "grasp":
-            if (
-                ee_reached_target
-                and cube_ready_to_attach
-                and gripper_width <= GRIPPER_CLOSE_WIDTH_THRESHOLD
-            ):
-                cube_attached = True
-                grasp_hold_frames = 0
-                target_cube.set_world_pose(
-                    position=desired_cube_position,
-                    orientation=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
-                )
-                target_cube.set_linear_velocity(np.zeros(3, dtype=np.float32))
-                target_cube.set_angular_velocity(np.zeros(3, dtype=np.float32))
-        # 释放阶段：只有当末端真的到托盘附近，才开始把方块平滑放到托盘目标处。
-        elif cube_attached and phase_name == "release":
-            carried_cube_position = (
-                (1.0 - ATTACHED_CUBE_BLEND) * cube_position + ATTACHED_CUBE_BLEND * desired_cube_position
-            ).astype(np.float32)
-            if ee_reached_target and cube_ready_to_release:
-                if place_settle_step == 0:
-                    release_start_position = carried_cube_position.copy()
-                place_settle_step += 1
-                settle_alpha = smoothstep(place_settle_step / float(PLACE_SETTLE_STEPS))
-                settled_position = (
-                    (1.0 - settle_alpha) * release_start_position + settle_alpha * PLACE_GOAL_POSITION
-                ).astype(np.float32)
-                target_cube.set_world_pose(
-                    position=settled_position,
-                    orientation=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
-                )
-                target_cube.set_linear_velocity(np.zeros(3, dtype=np.float32))
-                target_cube.set_angular_velocity(np.zeros(3, dtype=np.float32))
-                if place_settle_step >= PLACE_SETTLE_STEPS:
-                    cube_attached = False
-            else:
-                place_settle_step = 0
-                target_cube.set_world_pose(
-                    position=carried_cube_position,
-                    orientation=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
-                )
-                target_cube.set_linear_velocity(np.zeros(3, dtype=np.float32))
-                target_cube.set_angular_velocity(np.zeros(3, dtype=np.float32))
-
-        # 到这里再记录当前帧数据，保证图像和状态对应“动作执行后”的结果。
-        front_images.append(capture_rgb(front_camera))
-        wrist_images.append(capture_rgb(wrist_camera))
-        states.append(get_robot_state(franka))
-        actions.append(task_space_action)
+        ee_to_target_xy = planar_distance(ee_position, target_position)
+        ee_to_target_z = vertical_distance(ee_position, target_position)
+        ee_to_cube_xy = planar_distance(ee_position, cube_position)
+        ee_to_cube_z = vertical_distance(ee_position, cube_position)
+        cube_to_desired_xy = planar_distance(cube_position, desired_cube_position)
+        cube_to_desired_z = vertical_distance(cube_position, desired_cube_position)
 
         success = is_cube_inside_box(target_cube)
-        rewards.append(1.0 if success else 0.0)
-        dones.append(False)
+        should_capture_frame = (debug_step_index % CAPTURE_EVERY_STEPS) == 0
+        # 到这里再记录当前帧数据，保证图像和状态对应“动作执行后”的结果。
+        # 默认改成隔帧采样，主要是为了降低两路图像采集和写盘压力。
+        if should_capture_frame:
+            front_images.append(capture_rgb(front_camera))
+            wrist_images.append(capture_rgb(wrist_camera))
+            states.append(get_robot_state(franka))
+            actions.append(task_space_action)
+            rewards.append(1.0 if success else 0.0)
+            dones.append(False)
+
+        if phase_name in {
+            "pre_grasp_settle",
+            "grasp_close",
+            "grasp_hold",
+            "pre_release_settle",
+            "release_open",
+            "post_release_settle",
+        } and debug_step_index % DEBUG_PRINT_EVERY_STEPS == 0:
+            print(
+                f"[episode {episode_index:03d}]"
+                f" phase={phase_name}"
+                f" ee={rounded_list(ee_position)}"
+                f" cube={rounded_list(cube_position)}"
+                f" target={rounded_list(target_position)}"
+                f" gripper_width={round(gripper_width, 4)}"
+                f" reach_xy={round(ee_to_target_xy, 4)}/{round(ee_reach_xy_threshold, 4)}"
+                f" reach_z={round(ee_to_target_z, 4)}/{round(ee_reach_z_threshold, 4)}"
+                f" ee_cube_xy={round(ee_to_cube_xy, 4)}"
+                f" ee_cube_z={round(ee_to_cube_z, 4)}"
+                f" cube_follow_xy={round(cube_to_desired_xy, 4)}/{round(GRASP_VERIFY_XY_THRESHOLD, 4)}"
+                f" cube_follow_z={round(cube_to_desired_z, 4)}/{round(GRASP_VERIFY_Z_THRESHOLD, 4)}"
+                f" phase_elapsed={phase_elapsed_frames}"
+                f" phase_frames={phase_reached_frames}"
+                f" grasp_hold_frames={grasp_hold_frames}"
+                f" release_hold_frames={release_hold_frames}"
+                f" ee_reached={ee_reached_target}"
+                f" cube_following={cube_following_ee}"
+                f" cube_lifted={cube_lifted_from_table}"
+                f" cube_grasped={cube_grasped_by_physics}"
+                f" success={success}",
+                flush=True,
+            )
 
         # 下面是阶段推进逻辑。
         #
@@ -1150,30 +1276,179 @@ def collect_episode(
         #
         # 释放阶段：
         # 需要方块真的被放进托盘并稳定若干帧。
-        if phase_name == "grasp":
-            if cube_attached:
+        if phase_name == "grasp_close":
+            # 闭爪动作单独成一个阶段：
+            # 末端已经停在 cube 中心附近后，再给夹爪几帧真正闭合时间。
+            # 如果当前版本的夹爪宽度反馈略慢或略有偏差，也允许靠时间兜底推进，
+            # 否则会出现“已经在抓取点，但永远不进下一阶段”的卡死现象。
+            if ee_reached_target:
+                if gripper_width <= GRIPPER_CLOSE_WIDTH_THRESHOLD:
+                    phase_reached_frames += 1
+                else:
+                    phase_reached_frames = 0
+                if (
+                    phase_reached_frames >= CLOSE_GRIPPER_STABLE_FRAMES
+                    or phase_elapsed_frames >= GRASP_CLOSE_COMMAND_STEPS
+                ):
+                    print(
+                        f"[episode {episode_index:03d}] advance_phase={phase_name}"
+                        f" reason={'gripper_closed' if phase_reached_frames >= CLOSE_GRIPPER_STABLE_FRAMES else 'close_command_timeout'}"
+                        f" ee={rounded_list(ee_position)}"
+                        f" cube={rounded_list(cube_position)}"
+                        f" gripper_width={round(gripper_width, 4)}"
+                        f" phase_elapsed={phase_elapsed_frames}"
+                        f" phase_frames={phase_reached_frames}",
+                        flush=True,
+                    )
+                    phase_index += 1
+                    phase_reached_frames = 0
+            else:
+                phase_reached_frames = 0
+        elif phase_name == "grasp_hold":
+            # 这里不再要求“已经抬离桌面”才能进入 lift。
+            # 原因是当前阶段目标还停在抓取低位，如果把“已抬起”作为前置条件，
+            # 状态机会卡在抓取点附近，后面的 lift / transfer / place 永远不会执行。
+            #
+            # 因此这一步只负责：
+            # 1. 让夹爪在抓取点保持闭合一小段时间
+            # 2. 给物理系统一点时间建立接触
+            #
+            # 真正是否抓稳，继续通过后续 lift 阶段的运动结果和最终 success 来判断。
+            if ee_reached_target:
                 grasp_hold_frames += 1
                 if grasp_hold_frames >= GRASP_HOLD_STEPS:
+                    print(
+                        f"[episode {episode_index:03d}] advance_phase={phase_name}"
+                        f" reason=grasp_hold_complete"
+                        f" ee={rounded_list(ee_position)}"
+                        f" cube={rounded_list(cube_position)}"
+                        f" gripper_width={round(gripper_width, 4)}"
+                        f" phase_elapsed={phase_elapsed_frames}"
+                        f" cube_grasped={cube_grasped_by_physics}"
+                        f" grasp_hold_frames={grasp_hold_frames}",
+                        flush=True,
+                    )
                     phase_index += 1
                     phase_reached_frames = 0
             else:
                 grasp_hold_frames = 0
-        elif phase_name == "release":
-            if not cube_attached and success:
-                release_hold_frames += 1
-                if release_hold_frames >= RELEASE_HOLD_STEPS:
+        elif phase_name == "pre_grasp_settle":
+            # 真正闭爪前，先要求末端在 cube 中心附近稳定停住几帧。
+            # 这样不会一进入目标区域就立刻开始闭爪。
+            #
+            # 这里不强依赖“张开宽度反馈一定大于阈值”，因为不同版本里开爪反馈
+            # 可能略小，但这不应该阻止进入闭爪阶段。
+            if ee_reached_target:
+                phase_reached_frames += 1
+                if phase_reached_frames >= PRE_GRASP_STABLE_FRAMES:
+                    print(
+                        f"[episode {episode_index:03d}] advance_phase={phase_name}"
+                        f" reason=ee_stable_near_cube_center"
+                        f" ee={rounded_list(ee_position)}"
+                        f" cube={rounded_list(cube_position)}"
+                        f" gripper_width={round(gripper_width, 4)}"
+                        f" phase_elapsed={phase_elapsed_frames}"
+                        f" phase_frames={phase_reached_frames}",
+                        flush=True,
+                    )
                     phase_index += 1
                     phase_reached_frames = 0
+            else:
+                phase_reached_frames = 0
+        elif phase_name == "pre_release_settle":
+            # 到托盘释放位后，先保持闭爪停稳几帧，再执行真正松爪。
+            if ee_reached_target:
+                phase_reached_frames += 1
+                if phase_reached_frames >= PRE_RELEASE_STABLE_FRAMES:
+                    print(
+                        f"[episode {episode_index:03d}] advance_phase={phase_name}"
+                        f" reason=ee_stable_over_box"
+                        f" ee={rounded_list(ee_position)}"
+                        f" cube={rounded_list(cube_position)}"
+                        f" gripper_width={round(gripper_width, 4)}"
+                        f" phase_elapsed={phase_elapsed_frames}"
+                        f" phase_frames={phase_reached_frames}",
+                        flush=True,
+                    )
+                    phase_index += 1
+                    phase_reached_frames = 0
+            else:
+                phase_reached_frames = 0
+        elif phase_name == "release_open":
+            # 松爪动作单独给几帧，让夹爪真正打开，而不是瞬间切到下一阶段。
+            if ee_reached_target:
+                if gripper_width >= GRIPPER_OPEN_WIDTH_THRESHOLD:
+                    phase_reached_frames += 1
+                else:
+                    phase_reached_frames = 0
+                if (
+                    phase_reached_frames >= OPEN_GRIPPER_STABLE_FRAMES
+                    or phase_elapsed_frames >= RELEASE_OPEN_COMMAND_STEPS
+                ):
+                    print(
+                        f"[episode {episode_index:03d}] advance_phase={phase_name}"
+                        f" reason={'gripper_opened' if phase_reached_frames >= OPEN_GRIPPER_STABLE_FRAMES else 'open_command_timeout'}"
+                        f" ee={rounded_list(ee_position)}"
+                        f" cube={rounded_list(cube_position)}"
+                        f" gripper_width={round(gripper_width, 4)}"
+                        f" phase_elapsed={phase_elapsed_frames}"
+                        f" phase_frames={phase_reached_frames}",
+                        flush=True,
+                    )
+                    phase_index += 1
+                    phase_reached_frames = 0
+            else:
+                phase_reached_frames = 0
+        elif phase_name == "post_release_settle":
+            # 松爪后停在托盘上方等待方块自然落稳，再认定放置完成。
+            # 如果本次没有真正放成功，也不要在这里卡死，这样至少能把“松爪+撤离”
+            # 这一整段动作跑完，便于从终端日志和画面一起调试。
+            if gripper_width >= GRIPPER_OPEN_WIDTH_THRESHOLD and success:
+                release_hold_frames += 1
+                if release_hold_frames >= RELEASE_HOLD_STEPS:
+                    print(
+                        f"[episode {episode_index:03d}] advance_phase={phase_name}"
+                        f" reason=place_success_verified"
+                        f" ee={rounded_list(ee_position)}"
+                        f" cube={rounded_list(cube_position)}"
+                        f" gripper_width={round(gripper_width, 4)}"
+                        f" phase_elapsed={phase_elapsed_frames}"
+                        f" release_hold_frames={release_hold_frames}",
+                        flush=True,
+                    )
+                    phase_index += 1
+                    phase_reached_frames = 0
+            elif phase_elapsed_frames >= POST_RELEASE_WAIT_STEPS:
+                print(
+                    f"[episode {episode_index:03d}] advance_phase={phase_name}"
+                    f" reason=post_release_timeout"
+                    f" ee={rounded_list(ee_position)}"
+                    f" cube={rounded_list(cube_position)}"
+                    f" gripper_width={round(gripper_width, 4)}"
+                    f" phase_elapsed={phase_elapsed_frames}"
+                    f" success={success}",
+                    flush=True,
+                )
+                phase_index += 1
+                phase_reached_frames = 0
             else:
                 release_hold_frames = 0
         else:
             if ee_reached_target:
                 phase_reached_frames += 1
                 if phase_reached_frames >= PHASE_STABLE_FRAMES:
+                    print(
+                        f"[episode {episode_index:03d}] advance_phase={phase_name}"
+                        f" reason=ee_reached_target"
+                        f" ee={rounded_list(ee_position)}"
+                        f" cube={rounded_list(cube_position)}"
+                        f" target={rounded_list(target_position)}"
+                        f" phase_elapsed={phase_elapsed_frames}"
+                        f" phase_frames={phase_reached_frames}",
+                        flush=True,
+                    )
                     phase_index += 1
                     phase_reached_frames = 0
-                    if phase_name != "release":
-                        place_settle_step = 0
             else:
                 phase_reached_frames = 0
 
@@ -1203,9 +1478,10 @@ def collect_episode(
         print(
             "  debug:"
             f" phase={final_phase_name}"
-            f" ee={np.round(final_ee_position, 4).tolist()}"
-            f" target={np.round(final_phase_target, 4).tolist()}"
-            f" cube_attached={cube_attached}"
+            f" ee={rounded_list(final_ee_position)}"
+            f" target={rounded_list(final_phase_target)}"
+            f" cube={rounded_list(final_cube_position)}"
+            f" cube_grasped={cube_grasped_by_physics}"
             f" gripper_width={round(gripper_width, 4)}",
             flush=True,
         )
