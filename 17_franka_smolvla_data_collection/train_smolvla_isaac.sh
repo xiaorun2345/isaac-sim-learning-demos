@@ -3,14 +3,14 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-DATASET_REPO_ID="${DATASET_REPO_ID:-local/isaac_franka_front_wrist_state15_action4}"
+DATASET_REPO_ID="${DATASET_REPO_ID:-local/isaac_franka_front_top_state18_action4}"
 DATASET_ROOT="${DATASET_ROOT:-$SCRIPT_DIR/outputs/lerobot_dataset}"
-OUTPUT_DIR="${OUTPUT_DIR:-$SCRIPT_DIR/outputs/smolvla_isaac_franka_front_wrist_state15_action4}"
+OUTPUT_DIR="${OUTPUT_DIR:-$SCRIPT_DIR/outputs/smolvla_isaac_franka_front_top_state18_action4}"
 POLICY_PATH="${POLICY_PATH:-lerobot/smolvla_base}"
-LOCAL_POLICY_DIR="${LOCAL_POLICY_DIR:-$SCRIPT_DIR/outputs/pretrained/smolvla_isaac_franka_front_wrist_state15_action4_base}"
+LOCAL_POLICY_DIR="${LOCAL_POLICY_DIR:-$SCRIPT_DIR/outputs/pretrained/smolvla_isaac_franka_front_top_state18_action4_base}"
 LOCAL_SOURCE_POLICY_DIR="${LOCAL_SOURCE_POLICY_DIR:-/home/mkls/xiao_run/lerobot_smolvla_mujoco_demo/outputs/pretrained/smolvla_panda_dualcam_state7_base}"
 LOCAL_HF_CACHE_DIR="${LOCAL_HF_CACHE_DIR:-/home/mkls/xiao_run/lerobot_smolvla_mujoco_demo/.cache/huggingface}"
-JOB_NAME="${JOB_NAME:-smolvla_isaac_franka_front_wrist_state15_action4}"
+JOB_NAME="${JOB_NAME:-smolvla_isaac_franka_front_top_state18_action4}"
 EPOCHS="${EPOCHS:-5}"
 STEPS="${STEPS:-}"
 BATCH_SIZE="${BATCH_SIZE:-4}"

@@ -18,12 +18,14 @@
 
     python isaac-sim-learning-demos/17_franka_smolvla_data_collection/replay_episode.py
     python isaac-sim-learning-demos/17_franka_smolvla_data_collection/replay_episode.py --episode 1
+    python isaac-sim-learning-demos/17_franka_smolvla_data_collection/replay_episode.py --episode 0 --count 5
     python isaac-sim-learning-demos/17_franka_smolvla_data_collection/replay_episode.py --headless
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import time
 import traceback
@@ -43,7 +45,8 @@ def parse_args() -> argparse.Namespace:
         default=Path(__file__).resolve().parent / "outputs" / "raw",
         help="原始 npz episode 所在目录。",
     )
-    parser.add_argument("--episode", type=int, default=0, help="回放哪一个 episode。默认回放 episode_00000.npz")
+    parser.add_argument("--episode", type=int, default=0, help="从哪一个 episode 开始回放。默认从 episode_00000.npz 开始。")
+    parser.add_argument("--count", type=int, default=1, help="连续回放多少条 episode。默认 1。")
     parser.add_argument("--fps", type=float, default=20.0, help="回放节奏。")
     parser.add_argument("--headless", action="store_true", help="无界面运行。")
     parser.add_argument("--loop", action="store_true", help="循环回放。")
@@ -85,15 +88,20 @@ TABLE_SURFACE_Z = TABLE_H
 
 FRANKA_PRIM_PATH = "/World/Franka"
 FRONT_CAMERA_PATH = "/World/front_camera"
-WRIST_CAMERA_PATH = f"{FRANKA_PRIM_PATH}/panda_hand/wrist_camera"
+TOP_CAMERA_PATH = "/World/top_camera"
 
-FRONT_CAMERA_EYE = np.array([1.15, -1.10, 1.10], dtype=np.float32)
-FRONT_CAMERA_TARGET = np.array([0.46, 0.00, 0.55], dtype=np.float32)
+# 回放也保持和采集一致的机位，便于肉眼直接检查训练图像分布。
+FRONT_CAMERA_EYE = np.array([0.92, -0.62, 0.86], dtype=np.float32)
+FRONT_CAMERA_TARGET = np.array([0.50, 0.02, 0.43], dtype=np.float32)
+FRONT_CAMERA_FOCAL_LENGTH = 14.0
+TOP_CAMERA_EYE = np.array([0.50, -0.08, 1.34], dtype=np.float32)
+TOP_CAMERA_TARGET = np.array([0.50, 0.00, 0.40], dtype=np.float32)
+TOP_CAMERA_FOCAL_LENGTH = 15.0
 
 FRONT_CAMERA_RESOLUTION = (640, 480)
-WRIST_CAMERA_RESOLUTION = (640, 480)
+TOP_CAMERA_RESOLUTION = (640, 480)
 
-CUBE_SIZE = np.array([0.045, 0.045, 0.045], dtype=np.float32)
+CUBE_SIZE = np.array([0.055, 0.055, 0.055], dtype=np.float32)
 CUBE_HALF_Z = float(CUBE_SIZE[2] / 2.0)
 
 TARGET_CUBE_NAME = "cube_red"
@@ -102,9 +110,17 @@ DISTRACTOR_CUBE_SPECS = [
     ("cube_green", np.array([0.18, 0.66, 0.24], dtype=np.float32)),
     ("cube_blue", np.array([0.12, 0.36, 0.86], dtype=np.float32)),
 ]
-
-TARGET_CUBE_X_RANGE = (0.42, 0.44)
-TARGET_CUBE_Y_RANGE = (-0.02, 0.02)
+TARGET_CUBE_SPAWN_REGIONS = [
+    ("left_front", (0.28, 0.38), (0.12, 0.26)),
+    ("left_mid", (0.28, 0.40), (-0.08, 0.10)),
+    ("left_back", (0.28, 0.38), (-0.26, -0.12)),
+    ("center_front", (0.42, 0.54), (0.02, 0.16)),
+    ("center_back", (0.42, 0.58), (-0.24, -0.08)),
+    ("right_back", (0.56, 0.66), (-0.26, -0.10)),
+]
+TARGET_CUBE_BOX_EXCLUSION_MARGIN = 0.055
+TARGET_CUBE_DISTRACTOR_CLEARANCE_XY = 0.095
+TARGET_CUBE_SAMPLE_MAX_TRIES = 80
 
 DISTRACTOR_CUBE_LAYOUT = {
     "cube_green": np.array([0.34, 0.18, TABLE_SURFACE_Z + CUBE_HALF_Z], dtype=np.float32),
@@ -128,7 +144,7 @@ HOME_JOINT_POSITIONS = np.array(
 )
 
 EE_TARGET_ORIENTATION = euler_angles_to_quat(np.array([0.0, np.pi, 0.0], dtype=np.float32))
-EE_PICK_Z_OFFSET = 0.092
+EE_PICK_ACTION_Z_OFFSET = 0.013
 EE_FEEDBACK_Z_BIAS = 0.0985
 EE_GENERAL_REACH_XY_THRESHOLD = 0.030
 EE_GENERAL_REACH_Z_THRESHOLD = 0.030
@@ -137,8 +153,12 @@ EE_PICK_REACH_Z_THRESHOLD = 0.020
 EE_PLACE_REACH_XY_THRESHOLD = 0.040
 EE_PLACE_REACH_Z_THRESHOLD = 0.150
 GRIPPER_CLOSE_WIDTH_THRESHOLD = 0.065
-PICK_ATTACH_XY_THRESHOLD = 0.015
-PICK_ATTACH_Z_THRESHOLD = 0.020
+GRASP_VERIFY_XY_THRESHOLD = 0.020
+GRASP_VERIFY_Z_THRESHOLD = 0.030
+GRIPPER_OPEN_WIDTH_THRESHOLD = 0.085
+# 专家采集轨迹里，release 阶段夹爪常见开口大约在 0.08 左右，
+# 如果回放仍强制要求 >= 0.085，cube 会一直被判定成“还挂在夹爪上”。
+REPLAY_RELEASE_GRIPPER_WIDTH_THRESHOLD = 0.070
 PLACE_RELEASE_XY_THRESHOLD = 0.040
 PLACE_RELEASE_Z_THRESHOLD = 0.150
 ATTACH_POSITION_BLEND = 0.35
@@ -377,13 +397,13 @@ def build_scene() -> tuple[World, SingleManipulator, dict[str, DynamicCuboid]]:
         path=FRONT_CAMERA_PATH,
         position=tuple(FRONT_CAMERA_EYE.tolist()),
         rotation_xyz_deg=(-35.0, 0.0, 45.0),
-        focal_length=10.0,
+        focal_length=FRONT_CAMERA_FOCAL_LENGTH,
     )
     create_camera_prim(
-        path=WRIST_CAMERA_PATH,
-        position=(0.06, 0.0, 0.03),
-        rotation_xyz_deg=(-95.0, 0.0, -90.0),
-        focal_length=4.0,
+        path=TOP_CAMERA_PATH,
+        position=tuple(TOP_CAMERA_EYE.tolist()),
+        rotation_xyz_deg=(0.0, 90.0, 0.0),
+        focal_length=TOP_CAMERA_FOCAL_LENGTH,
     )
 
     world.reset()
@@ -392,6 +412,11 @@ def build_scene() -> tuple[World, SingleManipulator, dict[str, DynamicCuboid]]:
         eye=FRONT_CAMERA_EYE,
         target=FRONT_CAMERA_TARGET,
         camera_prim_path=FRONT_CAMERA_PATH,
+    )
+    set_camera_view(
+        eye=TOP_CAMERA_EYE,
+        target=TOP_CAMERA_TARGET,
+        camera_prim_path=TOP_CAMERA_PATH,
     )
     if not ARGS.headless:
         set_camera_view(
@@ -411,25 +436,40 @@ def create_cameras() -> tuple[Camera, Camera]:
     """
 
     front_camera = Camera(prim_path=FRONT_CAMERA_PATH, name="front_camera", resolution=FRONT_CAMERA_RESOLUTION)
-    wrist_camera = Camera(prim_path=WRIST_CAMERA_PATH, name="wrist_camera", resolution=WRIST_CAMERA_RESOLUTION)
+    top_camera = Camera(prim_path=TOP_CAMERA_PATH, name="top_camera", resolution=TOP_CAMERA_RESOLUTION)
     front_camera.initialize()
-    wrist_camera.initialize()
-    return front_camera, wrist_camera
+    top_camera.initialize()
+    return front_camera, top_camera
 
 
 def sample_cube_positions(rng: np.random.Generator) -> dict[str, np.ndarray]:
     """按与录制时相同的规则重建红色目标方块初始位置。"""
 
-    return {
-        TARGET_CUBE_NAME: np.array(
+    for _ in range(TARGET_CUBE_SAMPLE_MAX_TRIES):
+        _, x_range, y_range = TARGET_CUBE_SPAWN_REGIONS[rng.integers(len(TARGET_CUBE_SPAWN_REGIONS))]
+        target_position = np.array(
             [
-                rng.uniform(*TARGET_CUBE_X_RANGE),
-                rng.uniform(*TARGET_CUBE_Y_RANGE),
+                rng.uniform(*x_range),
+                rng.uniform(*y_range),
                 TABLE_SURFACE_Z + CUBE_HALF_Z,
             ],
             dtype=np.float32,
         )
-    }
+        inside_box_x = abs(float(target_position[0] - PLACE_BOX_CENTER[0])) <= (
+            PLACE_BOX_OUTER_X / 2.0 + TARGET_CUBE_BOX_EXCLUSION_MARGIN
+        )
+        inside_box_y = abs(float(target_position[1] - PLACE_BOX_CENTER[1])) <= (
+            PLACE_BOX_OUTER_Y / 2.0 + TARGET_CUBE_BOX_EXCLUSION_MARGIN
+        )
+        if inside_box_x and inside_box_y:
+            continue
+
+        if any(planar_distance(target_position, pos) < TARGET_CUBE_DISTRACTOR_CLEARANCE_XY for pos in DISTRACTOR_CUBE_LAYOUT.values()):
+            continue
+
+        return {TARGET_CUBE_NAME: target_position}
+
+    return {TARGET_CUBE_NAME: np.array([0.46, -0.18, TABLE_SURFACE_Z + CUBE_HALF_Z], dtype=np.float32)}
 
 
 def reset_robot(franka: SingleManipulator) -> None:
@@ -565,6 +605,14 @@ def resolve_episode_path(raw_dir: Path, episode: int) -> Path:
     return path
 
 
+def resolve_episode_paths(raw_dir: Path, start_episode: int, count: int) -> list[Path]:
+    """解析一段连续 episode 的文件路径列表。"""
+
+    if count < 1:
+        raise ValueError(f"--count must be >= 1, got {count}")
+    return [resolve_episode_path(raw_dir, start_episode + offset) for offset in range(count)]
+
+
 def reset_episode_from_npz(
     world: World,
     franka: SingleManipulator,
@@ -584,6 +632,10 @@ def reset_episode_from_npz(
     reset_robot(franka)
     reset_cubes(cubes, cube_positions)
     settle_scene(world, steps=20)
+    print(
+        f"  replay_reset target_cube={np.round(cube_positions[TARGET_CUBE_NAME], 4).tolist()}",
+        flush=True,
+    )
     return seed
 
 
@@ -606,11 +658,15 @@ def replay_episode(
     actions = np.asarray(data["action"], dtype=np.float32)
     done_flags = np.asarray(data["next.done"], dtype=np.bool_)
     task = str(np.asarray(data["task"]).item())
+    metadata = {}
+    if "metadata_json" in data.files:
+        metadata = json.loads(str(np.asarray(data["metadata_json"]).item()))
+    replay_repeat_steps = max(1, int(metadata.get("capture_every_steps", 1)))
     seed = reset_episode_from_npz(world, franka, cubes, data, episode_path)
     controller.reset()
     target_cube = cubes[TARGET_CUBE_NAME]
     cube_attached = False
-    attach_offset = np.array([0.0, 0.0, -EE_PICK_Z_OFFSET], dtype=np.float32)
+    attach_offset = np.array([0.0, 0.0, -EE_PICK_ACTION_Z_OFFSET], dtype=np.float32)
     placement_step_index = 0
     placement_start_position = PLACE_GOAL_POSITION.copy()
 
@@ -618,8 +674,9 @@ def replay_episode(
     print(f"  task: {task}", flush=True)
     print(f"  seed: {seed}", flush=True)
     print(f"  frames: {len(actions)}", flush=True)
+    print(f"  replay_repeat_steps: {replay_repeat_steps}", flush=True)
 
-    timestep = 1.0 / max(fps, 1e-6)
+    timestep = 1.0 / max(fps * replay_repeat_steps, 1e-6)
     start = time.perf_counter()
 
     for frame_idx, action in enumerate(actions):
@@ -629,72 +686,102 @@ def replay_episode(
         target_position = np.asarray(action[:3], dtype=np.float32)
         gripper_closed = bool(float(action[3]) >= 0.5)
 
-        arm_action = controller.forward(
-            target_end_effector_position=target_position,
-            target_end_effector_orientation=EE_TARGET_ORIENTATION,
-        )
-        gripper_action = franka.gripper.forward("close" if gripper_closed else "open")
-        joint_action = merge_joint_actions(franka.num_dof, arm_action, gripper_action)
-        franka.apply_action(joint_action)
-        world.step(render=True)
+        for repeat_idx in range(replay_repeat_steps):
+            arm_action = controller.forward(
+                target_end_effector_position=target_position,
+                target_end_effector_orientation=EE_TARGET_ORIENTATION,
+            )
+            gripper_action = franka.gripper.forward("close" if gripper_closed else "open")
+            joint_action = merge_joint_actions(franka.num_dof, arm_action, gripper_action)
+            franka.apply_action(joint_action)
+            world.step(render=True)
 
-        ee_position, _ = get_task_space_ee_pose(franka)
-        cube_position, _ = target_cube.get_world_pose()
-        cube_position = np.asarray(cube_position, dtype=np.float32)
-        joint_positions = np.asarray(franka.get_joint_positions(), dtype=np.float32)
-        gripper_width = float(joint_positions[7] + joint_positions[8])
-        desired_cube_position = ee_position + attach_offset
-        if gripper_closed:
-            ee_reached_target = is_position_close(
-                ee_position,
-                target_position,
-                EE_PICK_REACH_XY_THRESHOLD,
-                EE_PICK_REACH_Z_THRESHOLD,
-            )
-        else:
-            ee_reached_target = is_position_close(
-                ee_position,
-                target_position,
-                EE_PLACE_REACH_XY_THRESHOLD,
-                EE_PLACE_REACH_Z_THRESHOLD,
-            )
+            ee_position, _ = get_task_space_ee_pose(franka)
+            cube_position, _ = target_cube.get_world_pose()
+            cube_position = np.asarray(cube_position, dtype=np.float32)
+            joint_positions = np.asarray(franka.get_joint_positions(), dtype=np.float32)
+            gripper_width = float(joint_positions[7] + joint_positions[8])
+            desired_cube_position = ee_position + attach_offset
+            if gripper_closed:
+                ee_reached_target = is_position_close(
+                    ee_position,
+                    target_position,
+                    EE_PICK_REACH_XY_THRESHOLD,
+                    EE_PICK_REACH_Z_THRESHOLD,
+                )
+            else:
+                ee_reached_target = is_position_close(
+                    ee_position,
+                    target_position,
+                    EE_PLACE_REACH_XY_THRESHOLD,
+                    EE_PLACE_REACH_Z_THRESHOLD,
+                )
 
-        if gripper_closed and not cube_attached:
-            cube_ready_to_attach = is_position_close(
-                cube_position,
-                desired_cube_position,
-                PICK_ATTACH_XY_THRESHOLD,
-                PICK_ATTACH_Z_THRESHOLD,
-            )
-            if ee_reached_target and cube_ready_to_attach and gripper_width <= GRIPPER_CLOSE_WIDTH_THRESHOLD:
-                attach_offset = np.array([0.0, 0.0, -EE_PICK_Z_OFFSET], dtype=np.float32)
-                cube_attached = True
-                placement_step_index = 0
+            if gripper_closed and not cube_attached:
+                cube_ready_to_attach = is_position_close(
+                    cube_position,
+                    desired_cube_position,
+                    GRASP_VERIFY_XY_THRESHOLD,
+                    GRASP_VERIFY_Z_THRESHOLD,
+                )
+                if ee_reached_target and cube_ready_to_attach and gripper_width <= GRIPPER_CLOSE_WIDTH_THRESHOLD:
+                    attach_offset = np.array([0.0, 0.0, -EE_PICK_ACTION_Z_OFFSET], dtype=np.float32)
+                    cube_attached = True
+                    placement_step_index = 0
 
-        if cube_attached and gripper_closed:
-            smoothed_cube_position = (
-                (1.0 - ATTACH_POSITION_BLEND) * cube_position + ATTACH_POSITION_BLEND * desired_cube_position
-            ).astype(np.float32)
-            target_cube.set_world_pose(
-                position=smoothed_cube_position,
-                orientation=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
-            )
-            target_cube.set_linear_velocity(np.zeros(3, dtype=np.float32))
-            target_cube.set_angular_velocity(np.zeros(3, dtype=np.float32))
-        elif cube_attached and not gripper_closed:
-            cube_ready_to_release = is_position_close(
-                desired_cube_position,
-                PLACE_GOAL_POSITION,
-                PLACE_RELEASE_XY_THRESHOLD,
-                PLACE_RELEASE_Z_THRESHOLD,
-            )
-            carried_cube_position = (
-                (1.0 - ATTACH_POSITION_BLEND) * cube_position + ATTACH_POSITION_BLEND * desired_cube_position
-            ).astype(np.float32)
-            if ee_reached_target and cube_ready_to_release:
-                if placement_step_index == 0:
-                    placement_start_position = carried_cube_position.copy()
-                    placement_step_index = 1
+            if cube_attached and gripper_closed:
+                smoothed_cube_position = (
+                    (1.0 - ATTACH_POSITION_BLEND) * cube_position + ATTACH_POSITION_BLEND * desired_cube_position
+                ).astype(np.float32)
+                target_cube.set_world_pose(
+                    position=smoothed_cube_position,
+                    orientation=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+                )
+                target_cube.set_linear_velocity(np.zeros(3, dtype=np.float32))
+                target_cube.set_angular_velocity(np.zeros(3, dtype=np.float32))
+            elif cube_attached and not gripper_closed:
+                cube_ready_to_release = is_position_close(
+                    desired_cube_position,
+                    PLACE_GOAL_POSITION,
+                    PLACE_RELEASE_XY_THRESHOLD,
+                    PLACE_RELEASE_Z_THRESHOLD,
+                )
+                carried_cube_position = (
+                    (1.0 - ATTACH_POSITION_BLEND) * cube_position + ATTACH_POSITION_BLEND * desired_cube_position
+                ).astype(np.float32)
+                if (
+                    ee_reached_target
+                    and cube_ready_to_release
+                    and gripper_width >= REPLAY_RELEASE_GRIPPER_WIDTH_THRESHOLD
+                ):
+                    if placement_step_index == 0:
+                        placement_start_position = carried_cube_position.copy()
+                        placement_step_index = 1
+                    alpha = min(placement_step_index / float(PLACE_SETTLE_STEPS), 1.0)
+                    smooth_alpha = alpha * alpha * (3.0 - 2.0 * alpha)
+                    settled_position = (
+                        (1.0 - smooth_alpha) * placement_start_position + smooth_alpha * PLACE_GOAL_POSITION
+                    ).astype(np.float32)
+                    target_cube.set_world_pose(
+                        position=settled_position,
+                        orientation=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+                    )
+                    target_cube.set_linear_velocity(np.zeros(3, dtype=np.float32))
+                    target_cube.set_angular_velocity(np.zeros(3, dtype=np.float32))
+                    if placement_step_index < PLACE_SETTLE_STEPS:
+                        placement_step_index += 1
+                    else:
+                        placement_step_index = 0
+                        cube_attached = False
+                else:
+                    placement_step_index = 0
+                    target_cube.set_world_pose(
+                        position=carried_cube_position,
+                        orientation=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+                    )
+                    target_cube.set_linear_velocity(np.zeros(3, dtype=np.float32))
+                    target_cube.set_angular_velocity(np.zeros(3, dtype=np.float32))
+            elif placement_step_index > 0:
                 alpha = min(placement_step_index / float(PLACE_SETTLE_STEPS), 1.0)
                 smooth_alpha = alpha * alpha * (3.0 - 2.0 * alpha)
                 settled_position = (
@@ -710,39 +797,26 @@ def replay_episode(
                     placement_step_index += 1
                 else:
                     placement_step_index = 0
-                    cube_attached = False
-            else:
-                placement_step_index = 0
-                target_cube.set_world_pose(
-                    position=carried_cube_position,
-                    orientation=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
-                )
-                target_cube.set_linear_velocity(np.zeros(3, dtype=np.float32))
-                target_cube.set_angular_velocity(np.zeros(3, dtype=np.float32))
-        elif placement_step_index > 0:
-            alpha = min(placement_step_index / float(PLACE_SETTLE_STEPS), 1.0)
-            smooth_alpha = alpha * alpha * (3.0 - 2.0 * alpha)
-            settled_position = (
-                (1.0 - smooth_alpha) * placement_start_position + smooth_alpha * PLACE_GOAL_POSITION
-            ).astype(np.float32)
-            target_cube.set_world_pose(
-                position=settled_position,
-                orientation=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
-            )
-            target_cube.set_linear_velocity(np.zeros(3, dtype=np.float32))
-            target_cube.set_angular_velocity(np.zeros(3, dtype=np.float32))
-            if placement_step_index < PLACE_SETTLE_STEPS:
-                placement_step_index += 1
-            else:
-                placement_step_index = 0
 
-        target_time = start + (frame_idx + 1) * timestep
-        sleep_time = target_time - time.perf_counter()
-        if sleep_time > 0 and not ARGS.headless:
-            time.sleep(sleep_time)
+            global_step = frame_idx * replay_repeat_steps + repeat_idx + 1
+            target_time = start + global_step * timestep
+            sleep_time = target_time - time.perf_counter()
+            if sleep_time > 0 and not ARGS.headless:
+                time.sleep(sleep_time)
 
         if frame_idx < len(done_flags) and bool(done_flags[frame_idx]):
             break
+
+        if frame_idx % 20 == 0:
+            print(
+                f"  frame={frame_idx}"
+                f" ee={np.round(ee_position, 4).tolist()}"
+                f" cube={np.round(cube_position, 4).tolist()}"
+                f" target={np.round(target_position, 4).tolist()}"
+                f" gripper_width={round(gripper_width, 4)}"
+                f" attached={cube_attached}",
+                flush=True,
+            )
 
     cube_position, _ = target_cube.get_world_pose()
     ee_position, _ = franka.end_effector.get_world_pose()
@@ -757,7 +831,7 @@ def replay_episode(
 def main() -> None:
     """脚本主入口。"""
 
-    episode_path = resolve_episode_path(ARGS.raw_dir.resolve(), ARGS.episode)
+    episode_paths = resolve_episode_paths(ARGS.raw_dir.resolve(), ARGS.episode, ARGS.count)
     world, franka, cubes = build_scene()
     franka.initialize()
     create_cameras()
@@ -768,7 +842,10 @@ def main() -> None:
     try:
         while simulation_app.is_running():
             print("scene ready, start replay", flush=True)
-            replay_episode(world, franka, cubes, controller, episode_path, ARGS.fps)
+            for episode_path in episode_paths:
+                if not simulation_app.is_running():
+                    break
+                replay_episode(world, franka, cubes, controller, episode_path, ARGS.fps)
             if not ARGS.loop:
                 break
     finally:

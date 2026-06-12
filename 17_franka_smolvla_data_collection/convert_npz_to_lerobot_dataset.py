@@ -32,9 +32,19 @@ import numpy as np
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_RAW_DIR = SCRIPT_DIR / "outputs" / "raw"
 DEFAULT_DATASET_ROOT = SCRIPT_DIR / "outputs" / "lerobot_dataset"
-DEFAULT_REPO_ID = "local/isaac_franka_front_wrist_state15_action4"
+DEFAULT_REPO_ID = "local/isaac_franka_front_top_state18_action4"
 DEFAULT_ROBOT_TYPE = "isaacsim_franka_panda"
 DEFAULT_BASE_SIM_FPS = 60.0
+
+
+def resolve_secondary_image_key(payload: dict[str, Any]) -> str:
+    """兼容旧数据里的 wrist 图像字段，以及新数据里的 top 图像字段。"""
+
+    if "observation.images.top" in payload:
+        return "observation.images.top"
+    if "observation.images.wrist" in payload:
+        return "observation.images.wrist"
+    raise KeyError("Expected observation.images.top or observation.images.wrist in raw episode payload.")
 
 
 def parse_args() -> argparse.Namespace:
@@ -145,7 +155,8 @@ def infer_dataset_fps(args: argparse.Namespace, metadata: dict[str, Any]) -> int
 
 def build_features(first_payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
     front = np.asarray(first_payload["observation.images.front"])
-    wrist = np.asarray(first_payload["observation.images.wrist"])
+    secondary_image_key = resolve_secondary_image_key(first_payload)
+    top = np.asarray(first_payload[secondary_image_key])
     state = np.asarray(first_payload["observation.state"])
     action = np.asarray(first_payload["action"])
     state_names = np.asarray(first_payload["state_names"]).tolist()
@@ -153,8 +164,8 @@ def build_features(first_payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
     if front.ndim != 4 or front.shape[-1] != 3:
         raise ValueError(f"Unexpected front image shape: {front.shape}")
-    if wrist.ndim != 4 or wrist.shape[-1] != 3:
-        raise ValueError(f"Unexpected wrist image shape: {wrist.shape}")
+    if top.ndim != 4 or top.shape[-1] != 3:
+        raise ValueError(f"Unexpected top image shape: {top.shape}")
     if state.ndim != 2:
         raise ValueError(f"Unexpected observation.state shape: {state.shape}")
     if action.ndim != 2:
@@ -166,9 +177,9 @@ def build_features(first_payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
             "shape": tuple(front.shape[1:]),
             "names": ["height", "width", "channel"],
         },
-        "observation.images.wrist": {
+        "observation.images.top": {
             "dtype": "image",
-            "shape": tuple(wrist.shape[1:]),
+            "shape": tuple(top.shape[1:]),
             "names": ["height", "width", "channel"],
         },
         "observation.state": {
@@ -194,9 +205,10 @@ def build_features(first_payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 def validate_episode_shapes(payload: dict[str, Any], episode_path: Path) -> int:
     frame_count = int(np.asarray(payload["action"]).shape[0])
+    secondary_image_key = resolve_secondary_image_key(payload)
     expected_lengths = {
         "observation.images.front": int(np.asarray(payload["observation.images.front"]).shape[0]),
-        "observation.images.wrist": int(np.asarray(payload["observation.images.wrist"]).shape[0]),
+        secondary_image_key: int(np.asarray(payload[secondary_image_key]).shape[0]),
         "observation.state": int(np.asarray(payload["observation.state"]).shape[0]),
         "action": int(np.asarray(payload["action"]).shape[0]),
         "next.reward": int(np.asarray(payload["next.reward"]).shape[0]),
@@ -292,7 +304,8 @@ def main() -> None:
         frame_count = validate_episode_shapes(payload, episode_path)
         task = str(scalar_to_python(payload["task"]))
         front_images = np.asarray(payload["observation.images.front"], dtype=np.uint8)
-        wrist_images = np.asarray(payload["observation.images.wrist"], dtype=np.uint8)
+        secondary_image_key = resolve_secondary_image_key(payload)
+        top_images = np.asarray(payload[secondary_image_key], dtype=np.uint8)
         states = np.asarray(payload["observation.state"], dtype=np.float32)
         actions = np.asarray(payload["action"], dtype=np.float32)
         rewards = np.asarray(payload["next.reward"], dtype=np.float32)
@@ -302,7 +315,7 @@ def main() -> None:
             dataset.add_frame(
                 {
                     "observation.images.front": front_images[frame_index],
-                    "observation.images.wrist": wrist_images[frame_index],
+                    "observation.images.top": top_images[frame_index],
                     "observation.state": states[frame_index],
                     "action": actions[frame_index],
                     "next.reward": np.array([rewards[frame_index]], dtype=np.float32),

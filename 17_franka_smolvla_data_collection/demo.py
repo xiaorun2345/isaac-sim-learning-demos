@@ -150,17 +150,24 @@ TABLE_SURFACE_Z = TABLE_H
 FRANKA_PRIM_PATH = "/World/Franka"
 # 前视相机路径。
 FRONT_CAMERA_PATH = "/World/front_camera"
-# 手腕相机路径。它挂在 `panda_hand` 下，属于机器人结构的一部分。
-WRIST_CAMERA_PATH = f"{FRANKA_PRIM_PATH}/panda_hand/wrist_camera"
+# 俯视相机路径。它固定在世界坐标系下，从桌面上方观察整个操作区。
+TOP_CAMERA_PATH = "/World/top_camera"
 
-# 前视相机的观察位置。
-FRONT_CAMERA_EYE = np.array([1.15, -1.10, 1.10], dtype=np.float32)
-# 前视相机的目标注视点。
-FRONT_CAMERA_TARGET = np.array([0.46, 0.00, 0.55], dtype=np.float32)
+# 前视相机改成更贴近桌面的斜上方机位，减少整张图里“空背景”的占比，
+# 让红色 cube、夹爪和托盘在训练图像中更大、更清楚。
+FRONT_CAMERA_EYE = np.array([0.92, -0.62, 0.86], dtype=np.float32)
+# 目标注视点略压低到桌面操作区中心，避免视野过多浪费在房间和桌子边缘。
+FRONT_CAMERA_TARGET = np.array([0.50, 0.02, 0.43], dtype=np.float32)
+FRONT_CAMERA_FOCAL_LENGTH = 14.0
+
+# 俯视相机稍微后撤并抬高，保证整张桌面基本都在画面里。
+TOP_CAMERA_EYE = np.array([0.50, -0.08, 1.34], dtype=np.float32)
+TOP_CAMERA_TARGET = np.array([0.50, 0.00, 0.40], dtype=np.float32)
+TOP_CAMERA_FOCAL_LENGTH = 15.0
 
 # 两路相机分辨率。
 FRONT_CAMERA_RESOLUTION = (640, 480)
-WRIST_CAMERA_RESOLUTION = (640, 480)
+TOP_CAMERA_RESOLUTION = (640, 480)
 # 相机采样频率。
 CAMERA_FREQUENCY = 20
 CAMERA_WARMUP_STEPS = 20
@@ -168,8 +175,8 @@ CAMERA_CAPTURE_RETRIES = 6
 DEBUG_PRINT_EVERY_STEPS = 8
 CAPTURE_EVERY_STEPS = max(1, int(ARGS.capture_every))
 
-# 训练方块尺寸。
-CUBE_SIZE = np.array([0.045, 0.045, 0.045], dtype=np.float32)
+# 训练方块尺寸。适当放大一些，让视觉上更醒目，也更容易稳定抓取。
+CUBE_SIZE = np.array([0.055, 0.055, 0.055], dtype=np.float32)
 # 方块半高。因为方块中心点会放在 `桌面高度 + 半高` 处。
 CUBE_HALF_Z = float(CUBE_SIZE[2] / 2.0)
 
@@ -200,9 +207,9 @@ TARGET_CUBE_SPAWN_REGIONS = [
     ("right_back", (0.56, 0.66), (-0.26, -0.10)),
 ]
 # 采样时要明确避开托盘内侧，并给一个额外安全边界，避免 cube 刚好刷在盒子边上。
-TARGET_CUBE_BOX_EXCLUSION_MARGIN = 0.045
+TARGET_CUBE_BOX_EXCLUSION_MARGIN = 0.055
 # 也避免太贴近两个固定干扰方块，否则一开始就可能发生重叠或碰撞。
-TARGET_CUBE_DISTRACTOR_CLEARANCE_XY = 0.080
+TARGET_CUBE_DISTRACTOR_CLEARANCE_XY = 0.095
 TARGET_CUBE_SAMPLE_MAX_TRIES = 80
 
 # 两个干扰方块固定在左右两侧，只做视觉干扰，不直接挡住抓取路径。
@@ -290,7 +297,14 @@ GRASP_VERIFY_Z_THRESHOLD = 0.030
 GRASP_LIFT_MIN_HEIGHT = 0.010
 GRIPPER_OPEN_WIDTH_THRESHOLD = 0.085
 
-EPISODE_MAX_STEPS = 520
+EPISODE_MAX_STEPS = 680
+# 放置尾段对训练很关键，不能再被隔帧采样漏掉。
+ALWAYS_CAPTURE_PHASES = {
+    "release_open",
+    "post_release_settle",
+    "retreat",
+    "return_idle",
+}
 EPISODE_SETTLE_STEPS = 20
 
 STATE_NAMES = [
@@ -309,6 +323,9 @@ STATE_NAMES = [
     "ee_quat_y",
     "ee_quat_z",
     "gripper_width",
+    "target_cube_pos_x",
+    "target_cube_pos_y",
+    "target_cube_pos_z",
 ]
 
 ACTION_NAMES = [
@@ -593,13 +610,13 @@ def build_scene() -> tuple[World, SingleManipulator, dict[str, DynamicCuboid]]:
         path=FRONT_CAMERA_PATH,
         position=tuple(FRONT_CAMERA_EYE.tolist()),
         rotation_xyz_deg=(-35.0, 0.0, 45.0),
-        focal_length=10.0,
+        focal_length=FRONT_CAMERA_FOCAL_LENGTH,
     )
     create_camera_prim(
-        path=WRIST_CAMERA_PATH,
-        position=(0.06, 0.0, 0.03),
-        rotation_xyz_deg=(-95.0, 0.0, -90.0),
-        focal_length=4.0,
+        path=TOP_CAMERA_PATH,
+        position=tuple(TOP_CAMERA_EYE.tolist()),
+        rotation_xyz_deg=(0.0, 90.0, 0.0),
+        focal_length=TOP_CAMERA_FOCAL_LENGTH,
     )
 
     # `reset()` 是 Isaac Sim 中非常关键的一步：
@@ -610,6 +627,11 @@ def build_scene() -> tuple[World, SingleManipulator, dict[str, DynamicCuboid]]:
         eye=FRONT_CAMERA_EYE,
         target=FRONT_CAMERA_TARGET,
         camera_prim_path=FRONT_CAMERA_PATH,
+    )
+    set_camera_view(
+        eye=TOP_CAMERA_EYE,
+        target=TOP_CAMERA_TARGET,
+        camera_prim_path=TOP_CAMERA_PATH,
     )
     if not ARGS.headless:
         set_camera_view(
@@ -622,7 +644,7 @@ def build_scene() -> tuple[World, SingleManipulator, dict[str, DynamicCuboid]]:
 
 
 def create_cameras() -> tuple[Camera, Camera]:
-    """用传感器接口包装前视相机与手腕相机。
+    """用传感器接口包装前视相机与俯视相机。
 
     前面的 `create_camera_prim()` 只是把相机放到场景里；
     这里才是真正创建“程序里可读图像”的传感器接口。
@@ -634,16 +656,16 @@ def create_cameras() -> tuple[Camera, Camera]:
         frequency=CAMERA_FREQUENCY,
         resolution=FRONT_CAMERA_RESOLUTION,
     )
-    wrist_camera = Camera(
-        prim_path=WRIST_CAMERA_PATH,
-        name="wrist_camera",
+    top_camera = Camera(
+        prim_path=TOP_CAMERA_PATH,
+        name="top_camera",
         frequency=CAMERA_FREQUENCY,
-        resolution=WRIST_CAMERA_RESOLUTION,
+        resolution=TOP_CAMERA_RESOLUTION,
     )
     # 初始化传感器，之后才能稳定读取图像。
     front_camera.initialize()
-    wrist_camera.initialize()
-    return front_camera, wrist_camera
+    top_camera.initialize()
+    return front_camera, top_camera
 
 
 def sample_cube_positions(rng: np.random.Generator) -> dict[str, np.ndarray]:
@@ -985,11 +1007,13 @@ def get_task_space_ee_pose(franka: SingleManipulator) -> tuple[np.ndarray, np.nd
     return ee_position, ee_orientation
 
 
-def get_robot_state(franka: SingleManipulator) -> np.ndarray:
+def get_robot_state(franka: SingleManipulator, target_cube: DynamicCuboid) -> np.ndarray:
     """读取训练时常用的状态向量。"""
 
     joint_positions = np.asarray(franka.get_joint_positions(), dtype=np.float32)
     ee_position, ee_orientation = get_task_space_ee_pose(franka)
+    cube_position, _ = target_cube.get_world_pose()
+    cube_position = np.asarray(cube_position, dtype=np.float32)
     gripper_width = float(joint_positions[7] + joint_positions[8])
 
     return np.concatenate(
@@ -998,6 +1022,7 @@ def get_robot_state(franka: SingleManipulator) -> np.ndarray:
             ee_position[:3],
             ee_orientation[:4],
             np.array([gripper_width], dtype=np.float32),
+            cube_position[:3],
         ]
     ).astype(np.float32)
 
@@ -1030,7 +1055,7 @@ def episode_metadata() -> str:
             "state_names": STATE_NAMES,
             "action_names": ACTION_NAMES,
             "front_camera_resolution": FRONT_CAMERA_RESOLUTION,
-            "wrist_camera_resolution": WRIST_CAMERA_RESOLUTION,
+            "top_camera_resolution": TOP_CAMERA_RESOLUTION,
             "episode_max_steps": EPISODE_MAX_STEPS,
             "capture_every_steps": CAPTURE_EVERY_STEPS,
             "save_compressed": bool(ARGS.compress),
@@ -1044,7 +1069,7 @@ def save_episode(
     output_dir: Path,
     episode_index: int,
     front_images: list[np.ndarray],
-    wrist_images: list[np.ndarray],
+    top_images: list[np.ndarray],
     states: list[np.ndarray],
     actions: list[np.ndarray],
     rewards: list[float],
@@ -1063,7 +1088,7 @@ def save_episode(
 
     payload = {
         "observation.images.front": np.asarray(front_images, dtype=np.uint8),
-        "observation.images.wrist": np.asarray(wrist_images, dtype=np.uint8),
+        "observation.images.top": np.asarray(top_images, dtype=np.uint8),
         "observation.state": np.asarray(states, dtype=np.float32),
         "action": np.asarray(actions, dtype=np.float32),
         "next.reward": np.asarray(rewards, dtype=np.float32),
@@ -1088,7 +1113,7 @@ def collect_episode(
     franka: SingleManipulator,
     cubes: dict[str, DynamicCuboid],
     front_camera: Camera,
-    wrist_camera: Camera,
+    top_camera: Camera,
     controller: RMPFlowController,
     episode_index: int,
     output_dir: Path,
@@ -1114,7 +1139,7 @@ def collect_episode(
     settle_scene(world, EPISODE_SETTLE_STEPS)
 
     front_images: list[np.ndarray] = []
-    wrist_images: list[np.ndarray] = []
+    top_images: list[np.ndarray] = []
     states: list[np.ndarray] = []
     actions: list[np.ndarray] = []
     rewards: list[float] = []
@@ -1222,13 +1247,16 @@ def collect_episode(
         cube_to_desired_z = vertical_distance(cube_position, desired_cube_position)
 
         success = is_cube_inside_box(target_cube)
-        should_capture_frame = (debug_step_index % CAPTURE_EVERY_STEPS) == 0
+        should_capture_frame = (
+            phase_name in ALWAYS_CAPTURE_PHASES
+            or (debug_step_index % CAPTURE_EVERY_STEPS) == 0
+        )
         # 到这里再记录当前帧数据，保证图像和状态对应“动作执行后”的结果。
         # 默认改成隔帧采样，主要是为了降低两路图像采集和写盘压力。
         if should_capture_frame:
             front_images.append(capture_rgb(front_camera))
-            wrist_images.append(capture_rgb(wrist_camera))
-            states.append(get_robot_state(franka))
+            top_images.append(capture_rgb(top_camera))
+            states.append(get_robot_state(franka, target_cube))
             actions.append(task_space_action)
             rewards.append(1.0 if success else 0.0)
             dones.append(False)
@@ -1492,7 +1520,7 @@ def collect_episode(
         output_dir=output_dir,
         episode_index=episode_index,
         front_images=front_images,
-        wrist_images=wrist_images,
+        top_images=top_images,
         states=states,
         actions=actions,
         rewards=rewards,
@@ -1521,7 +1549,7 @@ def main() -> None:
 
     world, franka, cubes = build_scene()
     franka.initialize()
-    front_camera, wrist_camera = create_cameras()
+    front_camera, top_camera = create_cameras()
     # 相机初始化后再多跑几帧，尽量避免第一帧采图时传感器还没热起来。
     settle_scene(world, CAMERA_WARMUP_STEPS)
 
@@ -1548,7 +1576,7 @@ def main() -> None:
             franka=franka,
             cubes=cubes,
             front_camera=front_camera,
-            wrist_camera=wrist_camera,
+            top_camera=top_camera,
             controller=controller,
             episode_index=success_count,
             output_dir=output_dir,

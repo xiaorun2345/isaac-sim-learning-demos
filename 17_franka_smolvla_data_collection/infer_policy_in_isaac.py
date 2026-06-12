@@ -16,14 +16,21 @@
 
     python isaac-sim-learning-demos/17_franka_smolvla_data_collection/infer_policy_in_isaac.py \
         --policy-dir isaac-sim-learning-demos/17_franka_smolvla_data_collection/outputs/\
-smolvla_isaac_franka_front_wrist_state15_action4/checkpoints/140000/pretrained_model
+smolvla_isaac_franka_front_top_state18_action4/checkpoints/140000/pretrained_model
 """
 
 from __future__ import annotations
 
 import argparse
+import atexit
 import os
+import pickle
+import shutil
+import socket
+import struct
+import subprocess
 import sys
+import time
 import traceback
 from pathlib import Path
 
@@ -39,7 +46,7 @@ def parse_args() -> argparse.Namespace:
         default=(
             Path(__file__).resolve().parent
             / "outputs"
-            / "smolvla_isaac_franka_front_wrist_state15_action4"
+            / "smolvla_isaac_franka_front_top_state18_action4"
             / "checkpoints"
             / "last"
             / "pretrained_model"
@@ -72,13 +79,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--seed",
         type=int,
-        default=20260611,
-        help="随机种子基数。",
+        default=None,
+        help="随机种子基数。默认留空，此时每次启动都会自动生成新的随机种子。",
     )
     parser.add_argument(
         "--task",
         default="Pick up the red cube with Franka and place it into the wooden tray.",
         help="传给 SmolVLA 的任务文本。",
+    )
+    parser.add_argument(
+        "--spawn-profile",
+        choices=("center", "easy", "train"),
+        default="train",
+        help="评测时红色方块的摆放分布。train 与训练采集分布一致且默认随机，easy 次之，center 最容易。",
     )
     parser.add_argument(
         "--gripper-close-threshold",
@@ -98,10 +111,239 @@ def parse_args() -> argparse.Namespace:
         default=Path("/home/mkls/xiao_run/lerobot_smolvla_mujoco_demo/.cache/huggingface"),
         help="已有 SmolVLM 缓存目录。离线推理时会自动复用它。",
     )
+    parser.add_argument(
+        "--policy-host",
+        default="127.0.0.1",
+        help="SmolVLA 推理服务监听地址。",
+    )
+    parser.add_argument(
+        "--policy-port",
+        type=int,
+        default=5567,
+        help="SmolVLA 推理服务监听端口。",
+    )
+    parser.add_argument(
+        "--policy-server-conda-env",
+        type=Path,
+        default=Path("/home/mkls/xiao_run/.conda-lerobot-smolvla"),
+        help="运行 SmolVLA 推理服务的 Conda 环境目录，建议使用训练时的 Python 3.12 环境。",
+    )
+    parser.add_argument(
+        "--conda-exe",
+        type=Path,
+        default=Path("/home/mkls/anaconda3/bin/conda"),
+        help="conda 可执行文件路径，用于自动拉起独立推理服务。",
+    )
+    parser.add_argument(
+        "--no-auto-policy-server",
+        action="store_true",
+        help="不自动启动策略服务，改为连接已经手动启动好的服务。",
+    )
     return parser.parse_args()
 
 
 ARGS = parse_args()
+POLICY_SERVER_PROTOCOL_VERSION = "smolvla_socket_v2"
+
+
+def build_py311_compatible_lerobot_src(src_root: Path, cache_root: Path) -> Path:
+    """为 Python 3.11 生成一份可导入的 lerobot 源码副本。
+
+    你当前 Isaac 环境是 Python 3.11，但本地 lerobot 源码里混入了少量
+    Python 3.12 才支持的泛型语法，例如：
+
+    - `def func[T](...)`
+    - `class Foo[T]`
+
+    这会让 Python 3.11 在 import 阶段直接 SyntaxError。
+
+    这里不改外部仓库，而是在当前 demo 的缓存目录下复制一份源码，并把少量
+    3.12 语法降级成 3.11 兼容写法。
+    """
+
+    if sys.version_info >= (3, 12):
+        return src_root
+
+    compat_version = "v5"
+    dst_root = cache_root / "lerobot_py311_src"
+    marker_path = dst_root / ".py311_compat_ready"
+
+    if marker_path.is_file():
+        marker_text = marker_path.read_text(encoding="utf-8", errors="ignore")
+        if f"compat_version={compat_version}" in marker_text:
+            return dst_root
+
+    if dst_root.exists():
+        shutil.rmtree(dst_root)
+    shutil.copytree(src_root, dst_root)
+
+    def patch_file(relative_path: str, transformer) -> None:
+        file_path = dst_root / relative_path
+        text = file_path.read_text(encoding="utf-8")
+        text = transformer(text)
+        file_path.write_text(text, encoding="utf-8")
+
+    def patch_io_utils(text: str) -> str:
+        text = text.replace("from typing import Any", "from typing import Any, TypeVar")
+        text = text.replace(
+            'JsonLike = str | int | float | bool | None | list["JsonLike"] | dict[str, "JsonLike"] | tuple["JsonLike", ...]\n',
+            'JsonLike = str | int | float | bool | None | list["JsonLike"] | dict[str, "JsonLike"] | tuple["JsonLike", ...]\n'
+            'T = TypeVar("T", bound=JsonLike)\n',
+        )
+        text = text.replace(
+            "def deserialize_json_into_object[T: JsonLike](fpath: Path, obj: T) -> T:",
+            "def deserialize_json_into_object(fpath: Path, obj: T) -> T:",
+        )
+        return text
+
+    def patch_streaming_dataset(text: str) -> str:
+        text = text.replace("from pathlib import Path\n", "from pathlib import Path\nfrom typing import Generic, TypeVar\n")
+        text = text.replace(
+            "class Backtrackable[T]:",
+            'T = TypeVar("T")\n\n\nclass Backtrackable(Generic[T]):',
+        )
+        return text
+
+    def patch_pipeline(text: str) -> str:
+        text = text.replace(
+            "from typing import Any, TypedDict, TypeVar, cast",
+            "from typing import Any, Generic, TypedDict, TypeVar, cast",
+        )
+        text = text.replace(
+            "class DataProcessorPipeline[TInput, TOutput](HubMixin):",
+            "class DataProcessorPipeline(HubMixin, Generic[TInput, TOutput]):",
+        )
+        return text
+
+    def patch_motors_bus(text: str) -> str:
+        # Python 3.12:
+        #   type NameOrID = str | int
+        # Python 3.11:
+        #   NameOrID = str | int
+        text = text.replace("type NameOrID = str | int", "NameOrID = str | int")
+        text = text.replace("type Value = int | float", "Value = int | float")
+        return text
+
+    def patch_policies_init(_: str) -> str:
+        return '''"""Minimal policies package shim for Python 3.11 Isaac inference.
+
+This shim intentionally avoids importing every optional policy/config at package
+import time. The inference script imports concrete submodules directly.
+"""
+
+__all__ = []
+'''
+
+    def patch_smolvla_init(_: str) -> str:
+        return '''"""Minimal SmolVLA package shim for Python 3.11 Isaac inference.
+
+The inference script imports concrete SmolVLA submodules directly to avoid
+pulling optional training-only dependencies during package import.
+"""
+
+__all__ = []
+'''
+
+    def patch_processor_init(_: str) -> str:
+        return '''from lerobot.types import EnvAction, EnvTransition, PolicyAction, RobotAction, RobotObservation, TransitionKey
+
+from .batch_processor import AddBatchDimensionProcessorStep
+from .converters import (
+    batch_to_transition,
+    create_transition,
+    identity_transition,
+    policy_action_to_transition,
+    transition_to_batch,
+    transition_to_policy_action,
+)
+from .device_processor import DeviceProcessorStep
+from .newline_task_processor import NewLineTaskProcessorStep
+from .normalize_processor import NormalizerProcessorStep, UnnormalizerProcessorStep
+from .pipeline import (
+    ActionProcessorStep,
+    DataProcessorPipeline,
+    ObservationProcessorStep,
+    PolicyActionProcessorStep,
+    PolicyProcessorPipeline,
+    ProcessorKwargs,
+    ProcessorStep,
+    ProcessorStepRegistry,
+    RewardProcessorStep,
+)
+from .relative_action_processor import (
+    AbsoluteActionsProcessorStep,
+    RelativeActionsProcessorStep,
+    to_absolute_actions,
+    to_relative_actions,
+)
+from .rename_processor import RenameObservationsProcessorStep
+from .tokenizer_processor import TokenizerProcessorStep
+
+__all__ = [
+    "ActionProcessorStep",
+    "AbsoluteActionsProcessorStep",
+    "AddBatchDimensionProcessorStep",
+    "DataProcessorPipeline",
+    "DeviceProcessorStep",
+    "EnvAction",
+    "EnvTransition",
+    "NewLineTaskProcessorStep",
+    "NormalizerProcessorStep",
+    "ObservationProcessorStep",
+    "PolicyAction",
+    "PolicyActionProcessorStep",
+    "PolicyProcessorPipeline",
+    "ProcessorKwargs",
+    "ProcessorStep",
+    "ProcessorStepRegistry",
+    "RelativeActionsProcessorStep",
+    "RenameObservationsProcessorStep",
+    "RewardProcessorStep",
+    "RobotAction",
+    "RobotObservation",
+    "TokenizerProcessorStep",
+    "TransitionKey",
+    "UnnormalizerProcessorStep",
+    "batch_to_transition",
+    "create_transition",
+    "identity_transition",
+    "policy_action_to_transition",
+    "to_absolute_actions",
+    "to_relative_actions",
+    "transition_to_batch",
+    "transition_to_policy_action",
+]
+'''
+
+    def patch_pretrained(text: str) -> str:
+        text = text.replace(
+            "from typing import TypedDict, TypeVar, Unpack",
+            "from typing import TYPE_CHECKING, TypedDict, TypeVar, Unpack",
+        )
+        text = text.replace(
+            "from lerobot.configs.train import TrainPipelineConfig\n",
+            'if TYPE_CHECKING:\n    from lerobot.configs.train import TrainPipelineConfig\n',
+        )
+        text = text.replace(
+            "        cfg: TrainPipelineConfig,\n",
+            '        cfg: "TrainPipelineConfig",\n',
+        )
+        return text
+
+    patch_file("lerobot/utils/io_utils.py", patch_io_utils)
+    patch_file("lerobot/datasets/streaming_dataset.py", patch_streaming_dataset)
+    patch_file("lerobot/processor/pipeline.py", patch_pipeline)
+    patch_file("lerobot/motors/motors_bus.py", patch_motors_bus)
+    patch_file("lerobot/policies/__init__.py", patch_policies_init)
+    patch_file("lerobot/policies/smolvla/__init__.py", patch_smolvla_init)
+    patch_file("lerobot/policies/pretrained.py", patch_pretrained)
+    patch_file("lerobot/processor/__init__.py", patch_processor_init)
+
+    marker_path.write_text(
+        f"patched_from={src_root}\npython={sys.version}\ncompat_version={compat_version}\n",
+        encoding="utf-8",
+    )
+    return dst_root
 
 
 def prepare_offline_hf_cache(script_dir: Path) -> None:
@@ -127,7 +369,11 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 prepare_offline_hf_cache(SCRIPT_DIR)
 
 if ARGS.lerobot_src.is_dir():
-    sys.path.insert(0, str(ARGS.lerobot_src))
+    compat_lerobot_src = build_py311_compatible_lerobot_src(
+        src_root=ARGS.lerobot_src,
+        cache_root=SCRIPT_DIR / ".cache",
+    )
+    sys.path.insert(0, str(compat_lerobot_src))
 
 simulation_app = SimulationApp(
     {
@@ -139,8 +385,6 @@ simulation_app = SimulationApp(
     }
 )
 
-
-import torch
 from isaacsim.core.api import World
 from isaacsim.core.api.objects import DynamicCuboid, FixedCuboid
 from isaacsim.core.utils.rotations import euler_angles_to_quat
@@ -152,8 +396,6 @@ from isaacsim.robot.manipulators.examples.franka.controllers.rmpflow_controller 
 from isaacsim.robot.manipulators.grippers import ParallelGripper
 from isaacsim.sensors.camera import Camera
 from isaacsim.storage.native import get_assets_root_path
-from lerobot.configs import PreTrainedConfig
-from lerobot.policies import get_policy_class, make_pre_post_processors, prepare_observation_for_inference
 from pxr import Gf, UsdGeom, UsdLux
 
 
@@ -164,17 +406,22 @@ TABLE_SURFACE_Z = TABLE_H
 
 FRANKA_PRIM_PATH = "/World/Franka"
 FRONT_CAMERA_PATH = "/World/front_camera"
-WRIST_CAMERA_PATH = f"{FRANKA_PRIM_PATH}/panda_hand/wrist_camera"
+TOP_CAMERA_PATH = "/World/top_camera"
 
-FRONT_CAMERA_EYE = np.array([1.15, -1.10, 1.10], dtype=np.float32)
-FRONT_CAMERA_TARGET = np.array([0.46, 0.00, 0.55], dtype=np.float32)
+# 推理阶段必须和采集阶段使用同一前视角，否则图像分布会再次漂移。
+FRONT_CAMERA_EYE = np.array([0.92, -0.62, 0.86], dtype=np.float32)
+FRONT_CAMERA_TARGET = np.array([0.50, 0.02, 0.43], dtype=np.float32)
+FRONT_CAMERA_FOCAL_LENGTH = 14.0
+TOP_CAMERA_EYE = np.array([0.50, -0.08, 1.34], dtype=np.float32)
+TOP_CAMERA_TARGET = np.array([0.50, 0.00, 0.40], dtype=np.float32)
+TOP_CAMERA_FOCAL_LENGTH = 15.0
 FRONT_CAMERA_RESOLUTION = (640, 480)
-WRIST_CAMERA_RESOLUTION = (640, 480)
+TOP_CAMERA_RESOLUTION = (640, 480)
 CAMERA_FREQUENCY = 20
 CAMERA_WARMUP_STEPS = 20
 CAMERA_CAPTURE_RETRIES = 6
 
-CUBE_SIZE = np.array([0.045, 0.045, 0.045], dtype=np.float32)
+CUBE_SIZE = np.array([0.055, 0.055, 0.055], dtype=np.float32)
 CUBE_HALF_Z = float(CUBE_SIZE[2] / 2.0)
 TARGET_CUBE_NAME = "cube_red"
 TARGET_CUBE_COLOR = np.array([0.88, 0.15, 0.15], dtype=np.float32)
@@ -187,7 +434,13 @@ TARGET_CUBE_SPAWN_REGIONS = [
     ("center_back", (0.42, 0.58), (-0.24, -0.08)),
     ("right_back", (0.56, 0.66), (-0.26, -0.10)),
 ]
-TARGET_CUBE_BOX_EXCLUSION_MARGIN = 0.045
+EASY_TARGET_CUBE_SPAWN_REGIONS = [
+    ("easy_center_left", (0.34, 0.44), (-0.08, 0.08)),
+    ("easy_center_mid", (0.40, 0.50), (-0.12, 0.12)),
+    ("easy_center_right", (0.46, 0.56), (-0.08, 0.08)),
+]
+CENTER_TARGET_CUBE_POSITION = np.array([0.45, 0.0, TABLE_SURFACE_Z + CUBE_HALF_Z], dtype=np.float32)
+TARGET_CUBE_BOX_EXCLUSION_MARGIN = 0.055
 TARGET_CUBE_SAMPLE_MAX_TRIES = 80
 
 DISTRACTOR_CUBE_SPECS = [
@@ -198,7 +451,7 @@ DISTRACTOR_CUBE_LAYOUT = {
     "cube_green": np.array([0.34, 0.18, TABLE_SURFACE_Z + CUBE_HALF_Z], dtype=np.float32),
     "cube_blue": np.array([0.34, -0.18, TABLE_SURFACE_Z + CUBE_HALF_Z], dtype=np.float32),
 }
-TARGET_CUBE_DISTRACTOR_CLEARANCE_XY = 0.080
+TARGET_CUBE_DISTRACTOR_CLEARANCE_XY = 0.095
 
 PLACE_BOX_CENTER = np.array([0.64, 0.18], dtype=np.float32)
 PLACE_BOX_OUTER_X = 0.18
@@ -435,17 +688,18 @@ def build_scene() -> tuple[World, SingleManipulator, dict[str, DynamicCuboid]]:
         path=FRONT_CAMERA_PATH,
         position=tuple(FRONT_CAMERA_EYE.tolist()),
         rotation_xyz_deg=(-35.0, 0.0, 45.0),
-        focal_length=10.0,
+        focal_length=FRONT_CAMERA_FOCAL_LENGTH,
     )
     create_camera_prim(
-        path=WRIST_CAMERA_PATH,
-        position=(0.06, 0.0, 0.03),
-        rotation_xyz_deg=(-95.0, 0.0, -90.0),
-        focal_length=4.0,
+        path=TOP_CAMERA_PATH,
+        position=tuple(TOP_CAMERA_EYE.tolist()),
+        rotation_xyz_deg=(0.0, 90.0, 0.0),
+        focal_length=TOP_CAMERA_FOCAL_LENGTH,
     )
 
     world.reset()
     set_camera_view(eye=FRONT_CAMERA_EYE, target=FRONT_CAMERA_TARGET, camera_prim_path=FRONT_CAMERA_PATH)
+    set_camera_view(eye=TOP_CAMERA_EYE, target=TOP_CAMERA_TARGET, camera_prim_path=TOP_CAMERA_PATH)
     if not ARGS.headless:
         set_camera_view(eye=FRONT_CAMERA_EYE, target=FRONT_CAMERA_TARGET, camera_prim_path="/OmniverseKit_Persp")
     return world, franka, cubes
@@ -458,15 +712,15 @@ def create_cameras() -> tuple[Camera, Camera]:
         frequency=CAMERA_FREQUENCY,
         resolution=FRONT_CAMERA_RESOLUTION,
     )
-    wrist_camera = Camera(
-        prim_path=WRIST_CAMERA_PATH,
-        name="wrist_camera",
+    top_camera = Camera(
+        prim_path=TOP_CAMERA_PATH,
+        name="top_camera",
         frequency=CAMERA_FREQUENCY,
-        resolution=WRIST_CAMERA_RESOLUTION,
+        resolution=TOP_CAMERA_RESOLUTION,
     )
     front_camera.initialize()
-    wrist_camera.initialize()
-    return front_camera, wrist_camera
+    top_camera.initialize()
+    return front_camera, top_camera
 
 
 def planar_distance(a: np.ndarray, b: np.ndarray) -> float:
@@ -476,8 +730,15 @@ def planar_distance(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def sample_cube_positions(rng: np.random.Generator) -> dict[str, np.ndarray]:
+    if ARGS.spawn_profile == "center":
+        return {TARGET_CUBE_NAME: CENTER_TARGET_CUBE_POSITION.copy()}
+
+    spawn_regions = TARGET_CUBE_SPAWN_REGIONS
+    if ARGS.spawn_profile == "easy":
+        spawn_regions = EASY_TARGET_CUBE_SPAWN_REGIONS
+
     for _ in range(TARGET_CUBE_SAMPLE_MAX_TRIES):
-        _, x_range, y_range = TARGET_CUBE_SPAWN_REGIONS[rng.integers(len(TARGET_CUBE_SPAWN_REGIONS))]
+        _, x_range, y_range = spawn_regions[rng.integers(len(spawn_regions))]
         target_position = np.array(
             [rng.uniform(*x_range), rng.uniform(*y_range), TABLE_SURFACE_Z + CUBE_HALF_Z],
             dtype=np.float32,
@@ -496,7 +757,10 @@ def sample_cube_positions(rng: np.random.Generator) -> dict[str, np.ndarray]:
 
         return {TARGET_CUBE_NAME: target_position}
 
-    return {TARGET_CUBE_NAME: np.array([0.46, -0.18, TABLE_SURFACE_Z + CUBE_HALF_Z], dtype=np.float32)}
+    fallback_position = CENTER_TARGET_CUBE_POSITION.copy()
+    if ARGS.spawn_profile == "train":
+        fallback_position = np.array([0.46, -0.18, TABLE_SURFACE_Z + CUBE_HALF_Z], dtype=np.float32)
+    return {TARGET_CUBE_NAME: fallback_position}
 
 
 def reset_robot(franka: SingleManipulator) -> None:
@@ -575,9 +839,11 @@ def get_task_space_ee_pose(franka: SingleManipulator) -> tuple[np.ndarray, np.nd
     return ee_position, ee_orientation
 
 
-def get_robot_state(franka: SingleManipulator) -> np.ndarray:
+def get_robot_state(franka: SingleManipulator, target_cube: DynamicCuboid) -> np.ndarray:
     joint_positions = np.asarray(franka.get_joint_positions(), dtype=np.float32)
     ee_position, ee_orientation = get_task_space_ee_pose(franka)
+    cube_position, _ = target_cube.get_world_pose()
+    cube_position = np.asarray(cube_position, dtype=np.float32)
     gripper_width = float(joint_positions[7] + joint_positions[8])
     return np.concatenate(
         [
@@ -585,6 +851,7 @@ def get_robot_state(franka: SingleManipulator) -> np.ndarray:
             ee_position[:3],
             ee_orientation[:4],
             np.array([gripper_width], dtype=np.float32),
+            cube_position[:3],
         ]
     ).astype(np.float32)
 
@@ -622,56 +889,161 @@ def resolve_policy_dir(policy_dir: Path) -> Path:
     raise FileNotFoundError(f"Cannot find policy files under: {policy_dir}")
 
 
-def load_policy_bundle(policy_dir: Path):
-    policy_dir = resolve_policy_dir(policy_dir)
-    config = PreTrainedConfig.from_pretrained(str(policy_dir), local_files_only=True)
-    config.device = "cuda" if torch.cuda.is_available() else "cpu"
-    if config.device != "cuda":
-        config.use_amp = False
-    policy_class = get_policy_class(config.type)
-    policy = policy_class.from_pretrained(
+def recv_exact(sock: socket.socket, size: int) -> bytes:
+    chunks = bytearray()
+    while len(chunks) < size:
+        chunk = sock.recv(size - len(chunks))
+        if not chunk:
+            raise ConnectionError("Policy server closed the socket unexpectedly.")
+        chunks.extend(chunk)
+    return bytes(chunks)
+
+
+def send_pickle_message(sock: socket.socket, payload: dict) -> None:
+    body = pickle.dumps(payload, protocol=4)
+    sock.sendall(struct.pack("!I", len(body)))
+    sock.sendall(body)
+
+
+def recv_pickle_message(sock: socket.socket) -> dict:
+    header = recv_exact(sock, 4)
+    body_size = struct.unpack("!I", header)[0]
+    body = recv_exact(sock, body_size)
+    return pickle.loads(body)
+
+
+class PolicyServerClient:
+    def __init__(self, host: str, port: int):
+        self.host = host
+        self.port = port
+
+    def request(self, payload: dict) -> dict:
+        with socket.create_connection((self.host, self.port), timeout=30.0) as sock:
+            send_pickle_message(sock, payload)
+            response = recv_pickle_message(sock)
+        if response.get("status") != "ok":
+            raise RuntimeError(response.get("error", "Policy server returned an unknown error."))
+        return response
+
+    def ping(self) -> dict:
+        return self.request({"type": "ping"})
+
+    def reset(self) -> None:
+        self.request({"type": "reset"})
+
+    def predict(self, observation: dict[str, np.ndarray], task: str, robot_type: str) -> np.ndarray:
+        response = self.request(
+            {
+                "type": "predict",
+                "task": task,
+                "robot_type": robot_type,
+                "observation": observation,
+            }
+        )
+        return np.asarray(response["action"], dtype=np.float32)
+
+
+def find_free_tcp_port(host: str) -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind((host, 0))
+        return int(sock.getsockname()[1])
+
+
+def launch_policy_server(policy_dir: Path) -> subprocess.Popen | None:
+    if ARGS.no_auto_policy_server:
+        return None
+
+    # 自动拉起策略服务时，总是选择一个新的空闲端口，避免误连到历史残留的旧服务。
+    ARGS.policy_port = find_free_tcp_port(ARGS.policy_host)
+
+    server_script = SCRIPT_DIR / "smolvla_policy_server.py"
+    if not server_script.is_file():
+        raise FileNotFoundError(f"Cannot find policy server script: {server_script}")
+    if not ARGS.conda_exe.is_file():
+        raise FileNotFoundError(f"Cannot find conda executable: {ARGS.conda_exe}")
+    if not ARGS.policy_server_conda_env.is_dir():
+        raise FileNotFoundError(f"Cannot find policy server conda env: {ARGS.policy_server_conda_env}")
+
+    log_dir = SCRIPT_DIR / ".cache"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / "smolvla_policy_server.log"
+    log_file = log_path.open("a", encoding="utf-8")
+
+    command = [
+        str(ARGS.conda_exe),
+        "run",
+        "--prefix",
+        str(ARGS.policy_server_conda_env),
+        "python",
+        str(server_script),
+        "--policy-dir",
         str(policy_dir),
-        config=config,
-        local_files_only=True,
+        "--host",
+        ARGS.policy_host,
+        "--port",
+        str(ARGS.policy_port),
+        "--lerobot-src",
+        str(ARGS.lerobot_src),
+        "--fallback-hf-cache",
+        str(ARGS.fallback_hf_cache),
+    ]
+    process = subprocess.Popen(
+        command,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        text=True,
     )
-    preprocessor, postprocessor = make_pre_post_processors(config, pretrained_path=str(policy_dir))
-    print(f"Loaded policy: {policy_dir}", flush=True)
-    print(f"Policy type: {config.type}", flush=True)
-    print(f"Policy device: {config.device}", flush=True)
-    return policy, preprocessor, postprocessor, config.device
+    process._codex_log_file = log_file  # type: ignore[attr-defined]
+    return process
 
 
-def predict_policy_action(
-    observation: dict[str, np.ndarray],
-    task: str,
-    robot_type: str,
-    policy,
-    preprocessor,
-    postprocessor,
-    device: str,
-) -> np.ndarray:
-    observation = prepare_observation_for_inference(
-        observation=observation,
-        device=torch.device(device),
-        task=task,
-        robot_type=robot_type,
-    )
-    observation = preprocessor(observation)
-    with torch.inference_mode():
-        action = policy.select_action(observation)
-    action = postprocessor(action)
-    return action.squeeze(0).to("cpu").numpy().astype(np.float32)
+def cleanup_policy_server(process: subprocess.Popen | None) -> None:
+    if process is None:
+        return
+    try:
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=10)
+    except Exception:
+        process.kill()
+    log_file = getattr(process, "_codex_log_file", None)
+    if log_file is not None:
+        log_file.close()
+
+
+def wait_for_policy_server(client: PolicyServerClient, timeout_s: float, process: subprocess.Popen | None) -> dict:
+    deadline = time.time() + timeout_s
+    last_error: Exception | None = None
+    while time.time() < deadline:
+        if process is not None and process.poll() is not None:
+            raise RuntimeError(
+                "SmolVLA policy server exited early. "
+                f"See log: {SCRIPT_DIR / '.cache' / 'smolvla_policy_server.log'}"
+            )
+        try:
+            response = client.ping()
+            if response.get("protocol_version") != POLICY_SERVER_PROTOCOL_VERSION:
+                raise RuntimeError(
+                    "Connected to an incompatible policy server instance. "
+                    f"expected={POLICY_SERVER_PROTOCOL_VERSION}, got={response.get('protocol_version')}"
+                )
+            return response
+        except Exception as exc:
+            last_error = exc
+            time.sleep(1.0)
+    raise RuntimeError(f"Timed out waiting for policy server: {last_error}")
 
 
 def collect_policy_observation(
     front_camera: Camera,
-    wrist_camera: Camera,
+    top_camera: Camera,
     franka: SingleManipulator,
+    target_cube: DynamicCuboid,
 ) -> dict[str, np.ndarray]:
     return {
         "observation.images.front": capture_rgb(front_camera),
-        "observation.images.wrist": capture_rgb(wrist_camera),
-        "observation.state": get_robot_state(franka),
+        "observation.images.top": capture_rgb(top_camera),
+        "observation.state": get_robot_state(franka, target_cube),
     }
 
 
@@ -680,12 +1052,9 @@ def run_episode(
     franka: SingleManipulator,
     cubes: dict[str, DynamicCuboid],
     front_camera: Camera,
-    wrist_camera: Camera,
+    top_camera: Camera,
     controller: RMPFlowController,
-    policy,
-    preprocessor,
-    postprocessor,
-    device: str,
+    policy_client: PolicyServerClient,
     episode_index: int,
     seed: int,
 ) -> bool:
@@ -696,7 +1065,7 @@ def run_episode(
     reset_robot(franka)
     reset_cubes(cubes, cube_positions)
     controller.reset()
-    policy.reset()
+    policy_client.reset()
     settle_scene(world, 20)
 
     success = False
@@ -710,15 +1079,11 @@ def run_episode(
 
     for step in range(ARGS.max_steps):
         if step % max(1, ARGS.action_decimation) == 0:
-            observation = collect_policy_observation(front_camera, wrist_camera, franka)
-            last_policy_action = predict_policy_action(
+            observation = collect_policy_observation(front_camera, top_camera, franka, target_cube)
+            last_policy_action = policy_client.predict(
                 observation=observation,
                 task=ARGS.task,
                 robot_type="isaacsim_franka_panda",
-                policy=policy,
-                preprocessor=preprocessor,
-                postprocessor=postprocessor,
-                device=device,
             )
             target_position, gripper_closed = sanitize_policy_action(last_policy_action)
             if step % (ARGS.action_decimation * 5) == 0:
@@ -764,11 +1129,18 @@ def run_episode(
 
 
 def main() -> None:
-    policy, preprocessor, postprocessor, device = load_policy_bundle(ARGS.policy_dir)
+    resolved_policy_dir = resolve_policy_dir(ARGS.policy_dir)
+    policy_server_process = launch_policy_server(resolved_policy_dir)
+    atexit.register(cleanup_policy_server, policy_server_process)
+    policy_client = PolicyServerClient(ARGS.policy_host, ARGS.policy_port)
+    server_info = wait_for_policy_server(policy_client, timeout_s=120.0, process=policy_server_process)
+    print(f"Connected SmolVLA policy server: {server_info}", flush=True)
+    base_seed = ARGS.seed if ARGS.seed is not None else int(time.time() * 1000) % (2**31 - 1)
+    print(f"Inference spawn_profile={ARGS.spawn_profile} base_seed={base_seed}", flush=True)
 
     world, franka, cubes = build_scene()
     franka.initialize()
-    front_camera, wrist_camera = create_cameras()
+    front_camera, top_camera = create_cameras()
     settle_scene(world, CAMERA_WARMUP_STEPS)
 
     controller = RMPFlowController(
@@ -785,14 +1157,11 @@ def main() -> None:
             franka=franka,
             cubes=cubes,
             front_camera=front_camera,
-            wrist_camera=wrist_camera,
+            top_camera=top_camera,
             controller=controller,
-            policy=policy,
-            preprocessor=preprocessor,
-            postprocessor=postprocessor,
-            device=device,
+            policy_client=policy_client,
             episode_index=episode_index,
-            seed=ARGS.seed + episode_index,
+            seed=base_seed + episode_index,
         )
         success_count += int(success)
 

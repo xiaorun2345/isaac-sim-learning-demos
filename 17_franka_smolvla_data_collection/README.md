@@ -1,6 +1,6 @@
 # 17_franka_smolvla_data_collection
 
-这个目录用于做 **Franka + 双相机 + 专家策略** 的示教数据采集，目标是为后续
+这个目录用于做 **Franka + 前视/俯视双相机 + 专家策略** 的示教数据采集，目标是为后续
 **SmolVLA / LeRobot 风格训练** 准备一个干净、稳定、容易再转换的数据源。
 
 当前版本先解决第一步：
@@ -17,19 +17,25 @@
 请使用 Isaac Sim 自己的 Python 环境运行：
 
 ```bash
-python isaac-sim-learning-demos/17_franka_smolvla_data_collection/demo.py
+LD_LIBRARY_PATH=/home/mkls/xiao_run/.conda-isaac-openvla/lib:$LD_LIBRARY_PATH \
+/home/mkls/xiao_run/.conda-isaac-openvla/bin/python \
+isaac-sim-learning-demos/17_franka_smolvla_data_collection/demo.py
 ```
 
 如果你想无界面采集：
 
 ```bash
-python isaac-sim-learning-demos/17_franka_smolvla_data_collection/demo.py --headless
+LD_LIBRARY_PATH=/home/mkls/xiao_run/.conda-isaac-openvla/lib:$LD_LIBRARY_PATH \
+/home/mkls/xiao_run/.conda-isaac-openvla/bin/python \
+isaac-sim-learning-demos/17_franka_smolvla_data_collection/demo.py --headless
 ```
 
 如果你想多采几条：
 
 ```bash
-python isaac-sim-learning-demos/17_franka_smolvla_data_collection/demo.py --episodes 50
+LD_LIBRARY_PATH=/home/mkls/xiao_run/.conda-isaac-openvla/lib:$LD_LIBRARY_PATH \
+/home/mkls/xiao_run/.conda-isaac-openvla/bin/python \
+isaac-sim-learning-demos/17_franka_smolvla_data_collection/demo.py --episodes 50
 ```
 
 ## 动作回放
@@ -37,19 +43,25 @@ python isaac-sim-learning-demos/17_franka_smolvla_data_collection/demo.py --epis
 如果你想在 Isaac Sim 里重新执行某条已采集的轨迹，可以运行：
 
 ```bash
-python isaac-sim-learning-demos/17_franka_smolvla_data_collection/replay_episode.py
+LD_LIBRARY_PATH=/home/mkls/xiao_run/.conda-isaac-openvla/lib:$LD_LIBRARY_PATH \
+/home/mkls/xiao_run/.conda-isaac-openvla/bin/python \
+isaac-sim-learning-demos/17_franka_smolvla_data_collection/replay_episode.py
 ```
 
 回放指定 episode：
 
 ```bash
-python isaac-sim-learning-demos/17_franka_smolvla_data_collection/replay_episode.py --episode 1
+LD_LIBRARY_PATH=/home/mkls/xiao_run/.conda-isaac-openvla/lib:$LD_LIBRARY_PATH \
+/home/mkls/xiao_run/.conda-isaac-openvla/bin/python \
+isaac-sim-learning-demos/17_franka_smolvla_data_collection/replay_episode.py --episode 1
 ```
 
 循环回放：
 
 ```bash
-python isaac-sim-learning-demos/17_franka_smolvla_data_collection/replay_episode.py --episode 1 --loop
+LD_LIBRARY_PATH=/home/mkls/xiao_run/.conda-isaac-openvla/lib:$LD_LIBRARY_PATH \
+/home/mkls/xiao_run/.conda-isaac-openvla/bin/python \
+isaac-sim-learning-demos/17_franka_smolvla_data_collection/replay_episode.py --episode 1 --loop
 ```
 
 说明：
@@ -65,14 +77,15 @@ python isaac-sim-learning-demos/17_franka_smolvla_data_collection/replay_episode
 
 - `observation.images.front`
   前视相机 RGB 图像序列，形状大致为 `(T, H, W, 3)`
-- `observation.images.wrist`
-  手腕相机 RGB 图像序列，形状大致为 `(T, H, W, 3)`
+- `observation.images.top`
+  俯视相机 RGB 图像序列，形状大致为 `(T, H, W, 3)`
 - `observation.state`
-  状态序列，当前定义为 15 维：
+  状态序列，当前定义为 18 维：
   - 7 个机械臂关节
   - 3 个末端位置 xyz
   - 4 个末端姿态四元数 `wxyz`
   - 1 个夹爪开口宽度
+  - 3 个目标红色 cube 世界坐标 xyz
 - `action`
   动作序列，当前定义为 4 维：
   - 末端目标位置 `x y z`
@@ -144,12 +157,47 @@ python isaac-sim-learning-demos/17_franka_smolvla_data_collection/replay_episode
 
 ## 当前随机化范围
 
-当前只对训练方块做随机化，范围故意收得比较稳：
+当前已经不是单一小矩形随机，而是按多个桌面分区采样：
 
-- `x` 在 `0.42 ~ 0.44`
-- `y` 在 `-0.02 ~ 0.02`
+- `left_front`
+- `left_mid`
+- `left_back`
+- `center_front`
+- `center_back`
+- `right_back`
 
-原因很简单：第一版优先保证成功率和数据质量，不急着一开始就把随机化拉满。
+同时会额外避开：
+
+- 托盘内侧区域
+- 两个固定干扰方块附近
+
+当前目标 cube 也已经放大到 `5.5cm`，俯视相机会完整覆盖主要桌面区域。
+
+## 当前相机配置
+
+当前采集使用两路 RGB：
+
+- `front_camera`
+  斜前方视角，更强调夹爪、目标块和托盘的交互细节
+- `top_camera`
+  俯视全局视角，覆盖整张桌面的主要工作区
+
+这样做的目的，是同时保留：
+
+1. 局部抓取细节
+2. 全局相对位置关系
+
+## 当前训练命名
+
+当前默认训练命名已经切换到：
+
+- `front_top_state18_action4`
+
+其中：
+
+- `front_top` 表示前视 + 俯视双相机
+- `state18` 表示状态里包含 `cube xyz`
+- `action4` 表示动作是 `target_ee_xyz + target_gripper_closed`
 
 ## 下一步建议
 
